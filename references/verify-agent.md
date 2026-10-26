@@ -64,7 +64,7 @@ For each file:
    - `grep -l` on transcripts newer than the memory file, to look for evidence that an open item was
      done, then at most a few matching lines, each cut to 200 characters.
 
-   If Bash is not allowed in this run, use the Read, Glob and Grep tools for the same checks. Put
+   If Bash is not allowed in this run, use the Read, Glob and Grep tools for the same checks. Never Read a file inside a repository folder; use Glob only to see that the folder exists. Put
    every path in single quotes; if a path contains a single quote or a `..` component, or is under
    `/net/`, `/Network/`, `/Volumes/` or `/mnt/` (or `/home/` on macOS), do not check it and report
    the path as unusual. Run no git command and no other gh command. Never print whole large files

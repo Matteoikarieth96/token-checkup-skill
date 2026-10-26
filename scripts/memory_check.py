@@ -54,7 +54,7 @@ TYPE = re.compile(r"^[ \t]*type:[ \t]*[\"']?([A-Za-z_-]+)", re.M)
 SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 UNUSUAL = set("$`;&|()<>")
 NETWORK_ROOTS = ("/net", "/network", "/volumes", "/mnt")  # compared case-insensitively
-MACOS_ROOTS = ("/home",)  # automounted by auto_home on macOS
+MACOS_ROOTS = ("/home", "/system/volumes/data/home")  # auto_home mounts on macOS (lower case: matched case-insensitively)
 PLAIN_LINE = re.compile(r"- \[[^\[\]`\n]{1,300}\]\([^()\s`\[\]]{1,200}\.md\)[^\[\]`\n]{0,2000}")
 URLISH = re.compile(r"://|www\.", re.I)
 BACKUP_NAME = re.compile(r"\d{8}-\d{6}-\d{6}(?:-\d+)?")
@@ -332,6 +332,10 @@ def backup(mem, key=None):
         notes.append(f"rotation: {e.strerror or e}; older copies were kept")
     if errors:
         notes.append("rotation skipped: this copy failed, so every older copy was kept")
+        if not os.path.islink(dest):
+            shutil.rmtree(dest, ignore_errors=True)  # a partial copy must never count as a backup
+        notes.append("the partial copy was removed")
+        return {"path": None, "files": copied, "errors": errors, "notes": notes, "failed": True}
     if os.path.islink(dest) or not os.path.isdir(dest):
         errors.append("the new backup is missing after rotation")
     return {"path": dest, "files": copied, "errors": errors, "notes": notes, "failed": bool(errors)}

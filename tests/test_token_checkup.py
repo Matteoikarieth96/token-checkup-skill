@@ -725,6 +725,13 @@ class MemoryTests(Base):
         self.assertIs(res["failed"], True)
         self.assertTrue(all(os.path.isdir(g) for g in good))
         self.assertTrue(any("rotation skipped" in n for n in res["notes"]))
+        for _ in range(3):
+            with mock.patch.object(memory_check.shutil, "copy2", side_effect=copy):
+                memory_check.backup(mem)
+        memory_check.backup(mem)
+        self.assertTrue(os.path.isdir(good[-1]))  # partial copies never pushed a complete one out
+        left = [d for d in os.listdir(os.path.dirname(good[0])) if not d.startswith(".")]
+        self.assertEqual(len(left), 4)
 
     def test_any_copy_or_walk_error_fails_the_backup(self):
         mem = self.mem()
@@ -744,7 +751,7 @@ class MemoryTests(Base):
         with mock.patch.object(memory_check.shutil, "copy2", side_effect=copy):
             res = memory_check.backup(mem)
         self.assertEqual((res["files"], len(res["errors"])), (1, 12))
-        self.assertTrue(os.path.isdir(res["path"]))
+        self.assertIsNone(res["path"])  # the partial copy is removed
         self.assertIs(res["failed"], True)
         with mock.patch.object(memory_check.os, "walk", side_effect=walk):
             res = memory_check.backup(mem)
