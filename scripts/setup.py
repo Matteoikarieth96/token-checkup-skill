@@ -6,8 +6,10 @@
              project. Claude Code caps the value at each model's window, so only
              models with a larger window (1M models in practice) change. Settings are
              backed up first, and the autoCompactWindow from before the first install
-             is recorded so uninstall can restore it. Untagged hooks that look like a
-             context guard are listed and left alone, unless --replace-legacy is given.
+             is recorded so uninstall can restore it. If the user changed the value
+             after an install, a new install records the user's value instead.
+             Untagged hooks that look like a context guard are listed and left alone,
+             unless --replace-legacy is given.
   uninstall  remove the tagged hook and restore the previous autoCompactWindow, if the
              value is still the one install wrote.
   check      print what is installed, and whether the hook's interpreter and script exist.
@@ -216,8 +218,16 @@ def install(window, compact, replace_legacy=False):
     s.setdefault("hooks", {}).setdefault("UserPromptSubmit", []).append({"hooks": [entry]})
     rec = install_record()
     if compact:
-        if "previous_autoCompactWindow" not in rec:  # the value from before the first install only
-            rec["previous_autoCompactWindow"] = s.get("autoCompactWindow", MISSING)
+        cur = s.get("autoCompactWindow", MISSING)
+        if "previous_autoCompactWindow" not in rec:  # the value from before the first install
+            rec["previous_autoCompactWindow"] = cur
+        elif "installed_value" in rec and cur != rec["installed_value"]:
+            # the user changed the value after the last install: uninstall restores theirs
+            rec["previous_autoCompactWindow"] = cur
+            now = "not set" if cur == MISSING else clean(cur)
+            print(f"note: autoCompactWindow was changed after the last install (now {now}, install wrote "
+                  f"{clean(rec['installed_value'])}). Uninstall will "
+                  + ("leave it unset." if cur == MISSING else f"restore {now}."))
         rec["installed_value"] = window
         rec["installed_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         s["autoCompactWindow"] = window

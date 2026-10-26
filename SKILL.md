@@ -53,17 +53,24 @@ project folder in its prompt, so it skips this step.
   `memory_check.py` flags, at most 12 per run, at most 2 agents, on a small model. Never re-verify
   every memory in a weekly run.
 - **What runs without asking:** measuring, writing the report, memory backups, and one index fix:
-  dropping an index line whose target file does not exist (resolved inside the memory folder).
+  dropping an index line when every link on it points to a file that does not exist (links are
+  %xx-decoded and resolved inside the memory folder). A "mixed" line, with a broken link and a
+  link that works, is never dropped: it is a proposal.
   Fact fixes inside memory files run without asking only when `auto_fix_memory` is true (proved by
   a check, each file ending with a `Verified YYYY-MM-DD` line). `auto_fix_memory` is false by
   default and becomes true only when the user says yes at setup; while it is false, fact-check
   results are proposals.
-- **What needs the user's yes in chat, every time:** adding index lines for orphan files, shortening
-  long index lines, archiving, moving or deleting memories, splitting a memory, editing any
-  CLAUDE.md, changing settings, hooks, thresholds or connectors. A scheduled run leaves these as
-  proposals.
+- **What needs the user's yes in chat, every time:** adding index lines for orphan files, fixing
+  mixed index lines, shortening long index lines, archiving, moving or deleting memories, splitting
+  a memory, editing any CLAUDE.md, changing settings, hooks, thresholds or connectors. A scheduled
+  run leaves these as proposals.
 - Back up before touching memory: the `--backup` flag of `memory_check.py` does it (weekly step 3)
-  and keeps the last four copies.
+  in `~/.claude/token-checkup/backups/memory/<key>/` and keeps the last four copies of that project.
+- **git and gh only when the user is present.** Fact-check agents may run one fixed `git log` and
+  one `gh repo view --json` command, exactly as `references/verify-agent.md` writes them. They never
+  run `git status`, so uncommitted work is always reported as "not checked". Scheduled (unattended)
+  runs run no git and no gh at all: they check paths only and report git and GitHub claims as "not
+  checked".
 - Reply in the user's language. Say what is measured, what is estimated, and what was not checked.
 
 ## Setup (first run, or when the user asks)
@@ -121,16 +128,19 @@ project folder in its prompt, so it skips this step.
    If it says the project has no memory folder, skip this step and say so in the report.
    - Fact-check the memories under "Need a fact check" with up to 2 subagents, using
      `references/verify-agent.md` with MODE `fix` when `auto_fix_memory` is true and `propose` when
-     it is false (the script prints which). Order: missing paths first, then changed since
-     verified, then oldest verification. Max 12.
+     it is false (the script prints which), and RUN `interactive` when the user is in the session or
+     `unattended` for a scheduled run. Order: missing paths first, then changed since verified, then
+     oldest verification. Max 12. Missing paths are shown with `~` expanded; pass them that way.
    - Memories "waiting for the user" end with a `**Needs user` question: put it in the report's
      questions; do not send them to an agent.
-   - Index: drop the lines under "broken links" (their file does not exist). Orphans and long lines
-     become proposals. Links outside the memory folder are left alone; mention them.
+   - Index: drop the lines under "Index lines to drop" (every link on them is broken). "Mixed"
+     lines (a broken link next to one that works), orphans and long lines become proposals. Links
+     outside the memory folder are left alone; mention them.
    - "Unusual path text" is reported, never run or opened: mention it in the report.
 4. **Proposals** (numbered, each with the exact change and a rough saving):
    - fact fixes the agents found, when `auto_fix_memory` is false.
-   - index lines for orphan files, and shorter versions of long index lines (keeping any hard rule).
+   - index lines for orphan files, shorter versions of long index lines (keeping any hard rule),
+     and for each mixed index line the broken link to remove.
    - archive candidates: move to `memory/../memory-archive/<date>/`, list them with one line each in
      a `memory-archive.md` memory, remove their index lines. Never propose rules (`feedback`),
      user notes (`user`) or references.
@@ -160,14 +170,34 @@ project folder in its prompt, so it skips this step.
   9:00, local time) and the prompt below. Tell the user that scheduled tasks run while the app is
   open and the computer is awake; a run missed during sleep happens once, late.
 - **Elsewhere** (cron, launchd): the user's own scheduler runs `claude -p` with the prompt below.
-  Allow only the tools the run needs (with `--allowedTools`), and never use
+  Allow only what the run needs, with `--allowedTools`: the three scripts by absolute path, Read,
+  and edits limited to the memory folder and the report folder. For example, with the absolute
+  skill folder and the project key filled in (use `$CLAUDE_CONFIG_DIR` instead of `~/.claude` if
+  it is set):
+
+  ```bash
+  claude -p "<scheduled run prompt>" --allowedTools \
+    'Bash(python3 "<skill dir>/scripts/measure.py":*)' \
+    'Bash(python3 "<skill dir>/scripts/audit_start.py":*)' \
+    'Bash(python3 "<skill dir>/scripts/memory_check.py":*)' \
+    'Read' \
+    'Edit(~/.claude/projects/<key>/memory/**)' \
+    'Edit(~/.claude/token-checkup/reports/**)'
+  ```
+
+  Never allow generic rules such as `Bash(python3:*)`, `Bash(git:*)` or `Bash(gh:*)`, and never use
   `--dangerously-skip-permissions`: the run reads untrusted transcript text.
+- **Scheduled runs do no git or gh checks.** Nobody is there to watch them, so they check paths
+  only and report git and GitHub claims as "not checked". Run the checkup by hand when those checks
+  matter.
 
 ## Scheduled run prompt
 
 Use this, filling in the project folder and the skill folder, when creating the weekly task:
 
 > Run the token-checkup skill in weekly mode for the Claude Code project folder `<project folder>`.
+> This is an unattended run: run no git and no gh commands, and give fact-check agents RUN
+> `unattended`.
 > Run each of its scripts as `python3 "<skill dir>/scripts/<script>.py" --project "<project folder>"`.
 > Apply only what the skill allows without asking, write the report file, and end with the chat
 > summary and the numbered proposals. Do not apply any proposal: the user will answer in this

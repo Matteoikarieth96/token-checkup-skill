@@ -27,7 +27,7 @@ user's language. Mark every number as measured or estimated. Never quote a secre
 - Memory backup: <path>
 - Fact checks: <n> memories; <n> corrected (<file: what changed>, ...) when auto_fix_memory is true,
   otherwise listed as proposals below
-- Index fixes: <lines dropped because their file does not exist>
+- Index fixes: <lines dropped because every link on them was broken>
 
 ## Proposals (nothing applied yet)
 1. <exact change>: <why, rough saving>
@@ -37,5 +37,6 @@ user's language. Mark every number as measured or estimated. Never quote a secre
 - <from the fact checks and the memories waiting for the user>
 
 ## Not checked
-- <anything skipped and why: no memory folder, unusual path text, ...>
+- <anything skipped and why: no memory folder, unusual path text, uncommitted work, git and GitHub
+  claims in an unattended run, ...>
 ```

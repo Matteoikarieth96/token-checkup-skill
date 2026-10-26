@@ -2,17 +2,21 @@
 
 For the memory folder (~/.claude/projects/<key>/memory) it reports:
   - index problems in MEMORY.md: long lines, files missing from the index, links to files that
-    do not exist, links that point outside the memory folder
+    do not exist (%xx decoded first), links that point outside the memory folder. A line is to
+    drop only when every link on it is broken; a line with a broken link and another link is
+    "mixed" and only a proposal
   - per memory: size, type, last "Verified/Verificato YYYY-MM-DD" date (invalid and future dates
-    are ignored), changes since then, paths quoted in backticks that no longer exist, path text
-    that looks unusual (reported, never checked), [[links]] to memories that are gone
+    are ignored), changes since then, paths quoted in backticks that no longer exist (as written
+    and with "~" expanded), path text that looks unusual (reported, never checked), [[links]] to
+    memories that are gone
   - which memories need a fact check by an agent (never verified, verified long ago, or changed
     since), and which wait for the user (a line starting with "**Needs user")
   - archive candidates: project memories no session mentioned for N days (never rules or user notes)
   - split candidates: memories over N characters
 Only regular *.md files count: symlinks and folders are skipped. It changes nothing unless
 --backup is given, which first copies the regular *.md files of the folder (subfolders too,
-symlinks never followed) to the data dir and keeps the last four copies.
+symlinks never followed) to <data dir>/backups/memory/<project key>/<timestamp> and keeps the
+last four copies of that project. Flat backups/memory-* folders of earlier versions are left alone.
 
 Usage:
   memory_check.py --project <folder> [--json] [--backup]
@@ -28,19 +32,20 @@ import stat
 import sys
 import time
 import unicodedata
+from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import PROJECT_HELP, clean, config, data_dir, project_dir, read_text, regular_files, transcripts  # noqa: E402
 
 VERIFIED = re.compile(r"(?:Verificato|Verified)[*\s:]{0,8}(\d{4}-\d{2}-\d{2})")
 NEEDS_USER = re.compile(r"^\*\*Needs user", re.M)
-LINK = re.compile(r"\]\(([^)\s]+\.md)\)")
+LINK = re.compile(r"\]\(([^)\s]{1,200}\.md)\)")
 WIKI = re.compile(r"\[\[([^\]\n]{1,200})\]\]")
 PATH = re.compile(r"`((?:~|/Users|/home|/root|/private|/opt|/Library|/var|/tmp|/mnt|/srv)/[^`\n*?]{0,290})`")
 TYPE = re.compile(r"^[ \t]*type:[ \t]*[\"']?([A-Za-z_-]+)", re.M)
 SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 UNUSUAL = set("$`;&|()<>")
-BACKUP_NAME = re.compile(r"memory-\d{8}-\d{6}-\d{6}(?:-\d+)?")
+BACKUP_NAME = re.compile(r"\d{8}-\d{6}-\d{6}(?:-\d+)?")
 KEEP_TYPES = {"user", "feedback", "reference"}
 KEEP_BACKUPS = 4
 
@@ -70,9 +75,40 @@ def unusual(path_text):
 
 
 def resolve_link(mem, link):
-    """(normalized path, inside the memory folder?) of an index link, relative to the memory folder."""
-    p = os.path.normpath(os.path.join(mem, link))
+    """(normalized path, inside the memory folder?) of an index link: %xx decoded, relative to the memory folder."""
+    p = os.path.normpath(os.path.join(mem, unquote(link)))
     return p, p.startswith(mem + os.sep)
+
+
+def index_links(mem, index):
+    """Index links checked line by line.
+
+    A line is to drop only when every link on it points to a missing file inside the
+    memory folder. A line with a broken link and any other link (a working one, a URL or
+    one outside the memory folder) is "mixed": a proposal, never dropped.
+    """
+    r = {"indexed": set(), "broken": set(), "outside": set(), "drop": [], "mixed": [], "count": 0}
+    for n, line in enumerate(index.splitlines(), 1):
+        bad, other = [], []
+        for link in LINK.findall(line):
+            r["count"] += 1
+            if SCHEME.match(link):  # a web or other URL, not a memory file
+                other.append(link)
+                continue
+            p, inside = resolve_link(mem, link)
+            if not inside:
+                r["outside"].add(link)
+                other.append(link)
+                continue
+            r["indexed"].add(p)
+            (other if os.path.exists(p) else bad).append(link)
+        if bad:
+            r["broken"].update(bad)
+            if other:
+                r["mixed"].append({"line": n, "broken": bad, "other": other})
+            else:
+                r["drop"].append({"line": n, "broken": bad})
+    return r
 
 
 def mentioned_names(pdir, names, days):
@@ -104,18 +140,7 @@ def check(pdir, cfg):
     index = read_text(index_path) if "MEMORY.md" in index_files else ""
     entries = {os.path.basename(p): st for p, st in regular_files(mem, ".md") if os.path.basename(p) != "MEMORY.md"}
     files = sorted(entries)
-    linked = LINK.findall(index)
-    indexed, broken, outside = set(), [], []
-    for link in dict.fromkeys(linked):
-        if SCHEME.match(link):  # a web or other URL, not a memory file
-            continue
-        p, inside = resolve_link(mem, link)
-        if not inside:
-            outside.append(link)
-            continue
-        indexed.add(p)
-        if not os.path.exists(p):
-            broken.append(link)
+    links = index_links(mem, index)
     archive_names = set()
     arch = os.path.join(os.path.dirname(mem), "memory-archive")
     for _, _, fs in os.walk(arch):
@@ -136,8 +161,11 @@ def check(pdir, cfg):
         vdate = None if waiting else verified_date(text, today)
         found = list(dict.fromkeys(PATH.findall(text)))
         odd_paths = [p for p in found if unusual(p)]
-        dead_paths = [p for p in found if p not in odd_paths
-                      and not os.path.exists(os.path.expanduser(p.rstrip("/.,;:")))]
+        dead_paths = []
+        for p in found:
+            full = os.path.expanduser(p.rstrip("/.,;:"))
+            if p not in odd_paths and not os.path.exists(full):
+                dead_paths.append({"written": p, "expanded": full})
         dead_links = [w for w in dict.fromkeys(WIKI.findall(text))
                       if not os.path.exists(os.path.join(mem, w + ".md")) and w not in archive_names]
         mtype = frontmatter_type(text)
@@ -156,7 +184,7 @@ def check(pdir, cfg):
             "file": f, "type": mtype, "chars": len(text), "modified": str(mtime),
             "verified": str(vdate) if vdate else None, "waiting_for_user": waiting,
             "needs_check": reasons, "dead_paths": dead_paths[:5], "unusual_paths": odd_paths[:5],
-            "dead_links": dead_links, "in_index": path in indexed,
+            "dead_links": dead_links, "in_index": path in links["indexed"],
             "archive_candidate": mtype not in KEEP_TYPES and f not in used and f != "memory-archive.md",
             "split_candidate": len(text) > cfg["split_chars"],
         })
@@ -164,25 +192,36 @@ def check(pdir, cfg):
         "memory_dir": mem,
         "auto_fix_memory": cfg["auto_fix_memory"],
         "index_chars": len(index),
-        "index_entries": len(linked),
+        "index_entries": links["count"],
         "index_long_lines": long_lines,
         "orphans": [r["file"] for r in rows if not r["in_index"]],
-        "broken_index_links": sorted(broken),
-        "outside_index_links": sorted(outside),
+        "broken_index_links": sorted(links["broken"]),
+        "index_lines_to_drop": links["drop"],
+        "mixed_index_lines": links["mixed"],
+        "outside_index_links": sorted(links["outside"]),
         "unreadable": unreadable,
         "memories": rows,
     }
 
 
-def backup(mem):
-    """Copy the regular *.md files of the memory folder (subfolders too) to a new backup folder.
+def backup(mem, key=None):
+    """Copy the regular *.md files of the memory folder (subfolders too) to
+    <data dir>/backups/memory/<key>/<timestamp>.
 
+    key is the project key (default: the name of the folder that holds the memory folder).
     Symlinks are never followed. Errors are collected, not raised. Keeps the last
-    KEEP_BACKUPS folders whose name matches the backup pattern; nothing else is deleted.
+    KEEP_BACKUPS timestamp folders of this project only; other projects, other names and
+    the flat backups/memory-* folders of earlier versions are never deleted.
     """
+    key = key or os.path.basename(os.path.dirname(os.path.normpath(mem)))
+    if key in ("", ".", "..") or os.sep in key or "\0" in key:
+        raise ValueError(f"not a project key: {key!r}")
     root = os.path.join(data_dir(), "backups")
     os.makedirs(root, mode=0o700, exist_ok=True)
-    stamp = "memory-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    for part in ("memory", key):
+        root = os.path.join(root, part)
+        os.makedirs(root, mode=0o700, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     dest, n = os.path.join(root, stamp), 0
     while True:
         try:
@@ -235,7 +274,7 @@ def main():
     r = check(pdir, cfg)
     r["project"] = os.path.basename(pdir)
     if a.backup:
-        b = backup(r["memory_dir"])
+        b = backup(r["memory_dir"], os.path.basename(pdir))
         r["backup"], r["backup_files"], r["backup_errors"] = b["path"], b["files"], b["errors"]
     if a.json:
         print(json.dumps(r, indent=1))
@@ -253,8 +292,16 @@ def main():
         print(f"Backup: {r['backup']} ({r['backup_files']} files)")
         if r["backup_errors"]:
             print("Backup errors: " + "; ".join(clean(e) for e in r["backup_errors"][:10]))
+    def lines(items):
+        shown = [f"line {x['line']} ({names(x['broken'])})" for x in items[:20]]
+        return "; ".join(shown) + (f"; and {len(items) - 20} more (see --json)" if len(items) > 20 else "")
+
     print(f"Index: {len(r['index_long_lines'])} lines over {cfg['index_line_max']} chars; "
           f"orphans {names(r['orphans'])}; broken links {names(r['broken_index_links'])}")
+    print("Index lines to drop, every link on them broken: " + (lines(r["index_lines_to_drop"]) or "none"))
+    if r["mixed_index_lines"]:
+        print("Mixed index lines, some links broken and some not (a proposal, not dropped): "
+              + lines(r["mixed_index_lines"]))
     if r["outside_index_links"]:
         print("Index links outside the memory folder (left alone): " + names(r["outside_index_links"]))
     if r["unreadable"]:
@@ -263,7 +310,7 @@ def main():
     print(f"Need a fact check ({len(need)}):")
     for x in need:
         print(f"  {clean(x['file'])}: {', '.join(x['needs_check'])}"
-              + (f"  e.g. {clean(x['dead_paths'][0])}" if x["dead_paths"] else ""))
+              + (f"  e.g. {clean(x['dead_paths'][0]['expanded'], 400)}" if x["dead_paths"] else ""))
     waiting = [x["file"] for x in m if x["waiting_for_user"]]
     print(f"Waiting for the user ({len(waiting)}): {names(waiting)}")
     odd = [f"{clean(x['file'])} -> {names(x['unusual_paths'])}" for x in m if x["unusual_paths"]]

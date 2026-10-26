@@ -27,7 +27,7 @@ import memory_check  # noqa: E402
 import setup as tc_setup  # noqa: E402
 
 STAMPED_SETTINGS = re.compile(r"settings-\d{8}-\d{6}-\d{6}(?:-\d+)?\.json")
-STAMPED_MEMORY = re.compile(r"memory-\d{8}-\d{6}-\d{6}(?:-\d+)?")
+STAMPED_MEMORY = re.compile(r"\d{8}-\d{6}-\d{6}(?:-\d+)?")
 
 
 def assistant(mid, ctx, tool=None):
@@ -379,7 +379,7 @@ class MemoryTests(Base):
         self.assertTrue(rows["b.md"]["split_candidate"])
         self.assertIn("never verified", rows["b.md"]["needs_check"])
         self.assertEqual(rows["b.md"]["dead_links"], ["nowhere"])
-        self.assertEqual(rows["b.md"]["dead_paths"], ["~/definitely/not/here.txt"])
+        self.assertEqual([p["written"] for p in rows["b.md"]["dead_paths"]], ["~/definitely/not/here.txt"])
 
     def test_used_memory_is_not_archive_candidate(self):
         mem = self.mem()
@@ -448,7 +448,8 @@ class MemoryTests(Base):
                    + "p" * 400 + "`\n")
         row = self.rows()["p.md"]
         self.assertEqual(row["dead_links"], [])
-        self.assertEqual(row["dead_paths"], ["/var/definitely-missing-xyz"])
+        self.assertEqual(row["dead_paths"], [{"written": "/var/definitely-missing-xyz",
+                                              "expanded": "/var/definitely-missing-xyz"}])
         self.assertEqual(row["unusual_paths"], ["/tmp/$(touch pwned)", "/srv/a;b"])
 
     def test_printed_memory_text_is_sanitized(self):
@@ -506,16 +507,80 @@ class MemoryTests(Base):
     def test_backup_unique_names_and_safe_rotation(self):
         mem = self.mem()
         self.write(os.path.join(mem, "a.md"), "a\n")
-        root = os.path.join(common.data_dir(), "backups")
-        os.makedirs(os.path.join(root, "memory-keepme"))
-        os.makedirs(os.path.join(root, "memory-20200101-000000"))
+        backups = os.path.join(common.data_dir(), "backups")
+        root = os.path.join(backups, "memory", "-tmp-demo")
+        os.makedirs(os.path.join(root, "keepme"))
+        flat = os.path.join(backups, "memory-20200101-000000-000000")  # a flat folder from an earlier version
+        os.makedirs(flat)
         paths = [memory_check.backup(mem)["path"] for _ in range(6)]
         self.assertEqual(len(set(paths)), 6)
         names = sorted(os.listdir(root))
         stamped = [n for n in names if STAMPED_MEMORY.fullmatch(n)]
         self.assertEqual(stamped, [os.path.basename(p) for p in paths[-4:]])
-        self.assertIn("memory-keepme", names)
-        self.assertIn("memory-20200101-000000", names)
+        self.assertIn("keepme", names)
+        self.assertTrue(os.path.isdir(flat))
+
+    # round 2, item 3
+    def test_backups_rotate_per_project(self):
+        mem_a = self.mem()
+        self.write(os.path.join(mem_a, "a.md"), "a\n")
+        mem_b = os.path.join(self.tmp, "projects", "-tmp-other", "memory")
+        os.makedirs(mem_b)
+        self.write(os.path.join(mem_b, "b.md"), "b\n")
+        first = memory_check.backup(mem_a)["path"]
+        for _ in range(4):
+            memory_check.backup(mem_b)
+        self.assertTrue(os.path.isfile(os.path.join(first, "a.md")))
+        root = os.path.join(common.data_dir(), "backups", "memory")
+        self.assertEqual(os.path.dirname(first), os.path.join(root, "-tmp-demo"))
+        self.assertEqual(len(os.listdir(os.path.join(root, "-tmp-other"))), 4)
+
+    # round 2, item 4
+    def test_tilde_dead_paths_are_reported_expanded(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "MEMORY.md"), "- [T](t.md): x\n")
+        self.write(os.path.join(mem, "t.md"), "---\ntype: project\n---\nsee `~/definitely/not/here.txt`\n")
+        expanded = os.path.join(self.tmp, "definitely", "not", "here.txt")
+        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            row = self.rows()["t.md"]
+            proc = self.run_script("memory_check.py", "--project=-tmp-demo")
+        self.assertEqual(row["dead_paths"], [{"written": "~/definitely/not/here.txt", "expanded": expanded}])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(expanded, proc.stdout)
+        self.assertNotIn("e.g. ~/", proc.stdout)
+
+    # round 2, item 5
+    def test_index_links_are_percent_decoded(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "my note.md"), "n\n")
+        self.write(os.path.join(mem, "MEMORY.md"), "- [N](my%20note.md): x\n")
+        r = memory_check.check(self.pdir, common.config())
+        self.assertEqual(r["broken_index_links"], [])
+        self.assertEqual(r["orphans"], [])
+
+    def test_mixed_index_line_is_a_proposal_not_a_drop(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a.md"), "a\n")
+        self.write(os.path.join(mem, "MEMORY.md"),
+                   "- [A](a.md): see also [G](gone.md)\n- [X](gone2.md): x [Y](gone3.md)\n")
+        r = memory_check.check(self.pdir, common.config())
+        self.assertEqual([x["line"] for x in r.get("mixed_index_lines", [])], [1])
+        self.assertEqual([x["line"] for x in r.get("index_lines_to_drop", [])], [2])
+        self.assertEqual(r["broken_index_links"], ["gone.md", "gone2.md", "gone3.md"])
+        proc = self.run_script("memory_check.py", "--project=-tmp-demo")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Mixed index lines", proc.stdout)
+        self.assertIn("Index lines to drop, every link on them broken: line 2 (", proc.stdout)
+
+    def test_link_regex_is_linear(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "MEMORY.md"), "- [x" + "](" * 20_000 + "\n")
+        start = time.monotonic()
+        r = memory_check.check(self.pdir, common.config())
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertEqual(r["broken_index_links"], [])
+        self.assertEqual(memory_check.LINK.findall("- [A](a.md) [B](sub/my%20note.md)"), ["a.md", "sub/my%20note.md"])
+        self.assertEqual(memory_check.LINK.findall("](" + "a" * 201 + ".md)"), [])
 
 
 class SetupTests(Base):
@@ -649,6 +714,27 @@ class SetupTests(Base):
         out = self.call(tc_setup.uninstall)
         self.assertEqual(self.read_settings()["autoCompactWindow"], 300_000)
         self.assertIn("left", out)
+
+    # round 2, item 6
+    def test_reinstall_after_user_change_restores_user_value(self):
+        self.save_settings({"autoCompactWindow": 500_000})
+        self.call(tc_setup.install, 300_000, True)
+        s = self.read_settings()
+        s["autoCompactWindow"] = 400_000
+        self.save_settings(s)
+        out = self.call(tc_setup.install, 300_000, True)
+        self.call(tc_setup.uninstall)
+        self.assertEqual(self.read_settings()["autoCompactWindow"], 400_000)
+        self.assertIn("400000", out)
+        # the user removed the value after install: uninstall leaves it unset
+        self.save_settings({"autoCompactWindow": 500_000})
+        self.call(tc_setup.install, 300_000, True)
+        s = self.read_settings()
+        del s["autoCompactWindow"]
+        self.save_settings(s)
+        self.call(tc_setup.install, 300_000, True)
+        self.call(tc_setup.uninstall)
+        self.assertNotIn("autoCompactWindow", self.read_settings())
 
     def test_uninstall_with_nothing_installed_writes_nothing(self):
         self.assertIn("nothing to remove", self.call(tc_setup.uninstall))

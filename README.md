@@ -71,7 +71,7 @@ Requirements:
 
 - Claude Code (tested with 2.1.304 and 2.1.308), with auto-memory for the memory checks
 - Python 3.9 or newer, standard library only
-- git, for the fact checks; `gh` is optional (GitHub repo checks)
+- git and `gh` are optional: the fact checks use them only in runs where you are present
 - macOS or Linux
 
 ## Usage
@@ -89,7 +89,9 @@ In Claude Code, just ask:
 Everything runs locally. The scripts read transcripts and memory under `~/.claude` (or
 `$CLAUDE_CONFIG_DIR`) and write only to `~/.claude/token-checkup/` and, on install or uninstall, to
 `~/.claude/settings.json`. The scripts never touch the network. Claude and its subagents read the
-files they check, as in any Claude Code session, and may run a read-only `gh repo view`. Reports
+files they check, as in any Claude Code session. Only when you are present, they may run one fixed
+read-only `git log` command and one `gh repo view --json` command; scheduled runs run no git or gh.
+Reports
 hold numbers, file names and questions from the fact checks, never secrets. Details and residual
 risks: [SECURITY.md](SECURITY.md).
 
