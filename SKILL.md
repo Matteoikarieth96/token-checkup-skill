@@ -54,10 +54,10 @@ project folder in its prompt, so it skips this step.
   every memory in a weekly run.
 - **What runs without asking:** measuring, writing the report and memory backups. Nothing changes
   the memory index (`MEMORY.md`) on its own.
-  Fact fixes inside memory files run without asking only when `auto_fix_memory` is true (proved by
-  a check, each file ending with a `Verified YYYY-MM-DD` line). `auto_fix_memory` is false by
-  default and becomes true only when the user says yes at setup; while it is false, fact-check
-  results are proposals.
+  Fact fixes inside memory files run without asking only when `auto_fix_memory` is true and the
+  backup of this run worked (proved by a check, each file ending with a `Verified YYYY-MM-DD` line).
+  `auto_fix_memory` is false by default and becomes true only when the user says yes at setup;
+  while it is false, fact-check results are proposals.
 - **What needs the user's yes in chat, every time:** every index change (dropping a line with a
   broken link, removing a broken link from a mixed line, adding a line for an orphan file,
   shortening a long line), archiving, moving or deleting memories, splitting a memory, editing any
@@ -65,16 +65,18 @@ project folder in its prompt, so it skips this step.
   proposals.
 - Back up before touching memory: the `--backup` flag of `memory_check.py` does it (weekly step 3)
   in `~/.claude/token-checkup/backups/memory/<key>/` and keeps the last four copies of that project.
-  **If the backup failed** (the output says `Backup FAILED`), do not edit any memory file in this
-  run: every fact fix becomes a proposal, and the report says why. Files listed under
-  `Backup errors` were not copied: do not edit them.
+  Fix mode (agents edit memory files) is allowed only after a backup in this run that reported
+  `backup_failed: false` (`--json`), or printed `Backup: <path>` with no `Backup FAILED` line.
+  Otherwise every agent gets MODE `propose`. Any file that could not be copied fails the backup.
+  **If the backup failed**, do not edit any memory file in this run: every fact fix becomes a
+  proposal, and the report says why.
 - **No git, ever; gh only when the user is present.** No run uses git: a repository's own config can
-  make even a read-only git command run programs. For a local repo, fact-check agents only check
-  that the folder exists and read the plain file `<dir>/.git/HEAD` for the current branch; the last
-  commit, uncommitted work and anything else about the repo are reported as "not checked". When the
-  user is present, agents may run one `gh repo view OWNER/NAME --json visibility,isArchived,pushedAt`
-  command, exactly as `references/verify-agent.md` writes it. Scheduled (unattended) runs run no gh
-  at all and report GitHub claims as "not checked".
+  make even a read-only git command run programs. Agents never inspect a repository's contents: for
+  a local repo they only check that the folder exists, and its branch, commits, uncommitted work and
+  anything inside it are reported as "not checked". When the user is present, agents may run one
+  `gh repo view OWNER/NAME --json visibility,isArchived,pushedAt` command, exactly as
+  `references/verify-agent.md` writes it. Scheduled (unattended) runs run no gh at all and report
+  GitHub claims as "not checked".
 - Reply in the user's language. Say what is measured, what is estimated, and what was not checked.
 
 ## Setup (first run, or when the user asks)
@@ -133,20 +135,23 @@ project folder in its prompt, so it skips this step.
    `Backup FAILED`, do not edit any memory file in this run: run the fact checks with MODE `propose`
    and put the failure at the top of the report.
    - Fact-check the memories under "Need a fact check" with up to 2 subagents, using
-     `references/verify-agent.md` with MODE `fix` when `auto_fix_memory` is true and `propose` when
-     it is false (the script prints which), and RUN `interactive` when the user is in the session or
-     `unattended` for a scheduled run. Order: missing paths first, then changed since verified, then
-     oldest verification. Max 12. Missing paths are shown with `~` expanded; pass them that way.
+     `references/verify-agent.md` with the MODE the script prints (`--json`: `fact_check_mode`).
+     It is `fix` only when `auto_fix_memory` is true and the backup reported
+     `backup_failed: false`; otherwise it is `propose` for every agent. Fill {BACKUP} with the
+     backup path only when the backup worked, otherwise with `none: propose only`. Use RUN
+     `interactive` when the user is in the session or `unattended` for a scheduled run. Order:
+     missing paths first, then changed since verified, then oldest verification. Max 12. Missing
+     paths are shown with `~` expanded; pass them that way.
    - Memories "waiting for the user" end with a `**Needs user` question: put it in the report's
      questions; do not send them to an agent.
    - Index: change nothing. Lines under "Index drop candidates" (one plain link, broken), "mixed"
      lines (a broken link next to other text or links), orphans and long lines all become
      proposals. Links outside the memory folder are left alone; mention them.
    - "Unusual path text" (shell or control characters, a `..` component, or a path under `/net/`,
-     `/Network/`, `/Volumes/` or `/mnt/`) is reported, never run, opened or checked: mention it in
-     the report.
+     `/Network/`, `/Volumes/` or `/mnt/`, and on macOS `/home/`) is reported, never run, opened or
+     checked: mention it in the report.
 4. **Proposals** (numbered, each with the exact change and a rough saving):
-   - fact fixes the agents found, when `auto_fix_memory` is false.
+   - fact fixes the agents found, when they ran with MODE `propose`.
    - index changes: each drop candidate line to remove, for each mixed index line the broken link
      to remove, index lines for orphan files, and shorter versions of long index lines (keeping any
      hard rule).
@@ -178,7 +183,11 @@ project folder in its prompt, so it skips this step.
 - **Claude desktop app:** use the scheduled-tasks tool with a cron such as `0 9 * * 1` (Mondays
   9:00, local time) and the prompt below. Tell the user that scheduled tasks run while the app is
   open and the computer is awake; a run missed during sleep happens once, late.
-- **Elsewhere** (cron, launchd): the user's own scheduler runs `claude -p` with the prompt below.
+- **Elsewhere** (cron, launchd): the user's own scheduler runs `claude -p` with the prompt below,
+  started in the data folder (create it first with
+  `mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/token-checkup"` if it does not exist). Why: Claude
+  Code reads files in the folder it starts in without a rule, so a run started in the home folder
+  could read the whole home folder.
   Allow only what the run needs, with `--allowedTools`: the three scripts by absolute path, Read
   limited to the project's transcript folder (which holds `memory/`), the data folder and the skill
   folder, and edits limited to the memory folder and the report folder. For example, with the
@@ -188,6 +197,7 @@ project folder in its prompt, so it skips this step.
   single leading `/` means a path relative to the project, not an absolute one.
 
   ```bash
+  cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/token-checkup" &&
   claude -p "<scheduled run prompt>" --allowedTools \
     'Bash(python3 "<skill dir>/scripts/measure.py":*)' \
     'Bash(python3 "<skill dir>/scripts/audit_start.py":*)' \

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -663,12 +663,155 @@ class MemoryTests(Base):
                              r"fetch|remote|describe|ls-files|cat-file|for-each-ref)\b")
         for doc in ("SKILL.md", "SECURITY.md", "README.md", os.path.join("references", "verify-agent.md")):
             self.assertIsNone(git_cmd.search(self.read(os.path.join(root, doc))), doc)
-        self.assertIn(".git/HEAD", self.read(os.path.join(root, "references", "verify-agent.md")))
         skill = self.read(os.path.join(root, "SKILL.md"))
         self.assertNotIn("'Read'", skill)
         for rule in ("'Read(~/.claude/projects/<key>/**)'", "'Read(~/.claude/token-checkup/**)'",
                      "'Read(<skill dir>/**)'"):
             self.assertIn(rule, skill)
+
+    def docs(self):
+        root = os.path.dirname(HERE)
+        names = ("SKILL.md", "SECURITY.md", "README.md", os.path.join("references", "verify-agent.md"),
+                 os.path.join("references", "report.md"))
+        return {n: " ".join(self.read(os.path.join(root, n)).split()) for n in names}
+
+    def assertInDoc(self, part, text, name):
+        self.assertTrue(part in text, f"{name}: missing {part!r}")
+
+    # round 4, item 1
+    def test_docs_never_read_inside_a_repo(self):
+        inside_git = re.compile(r"/\.git\b|\.git/")  # a path that names a .git folder or a file in one
+        read_git = re.compile(r"\b(?:read|open|cat|list|look|inspect)\w*\b[^.,;:\n]{0,80}\.git\b", re.I)
+        for name, text in self.docs().items():
+            m = inside_git.search(text)
+            self.assertIsNone(m, f"{name}: {m and text[max(0, m.start() - 60):m.end() + 20]!r}")
+            for m in read_git.finditer(text):  # allowed only as a prohibition
+                before = text[max(0, m.start() - 20):m.start()]
+                self.assertRegex(before, r"(?i)\b(?:never|not|no)\b", f"{name}: {m.group(0)!r}")
+        name = os.path.join("references", "verify-agent.md")
+        verify = self.docs()[name]
+        for part in ("test -d '<dir>'", 'its branch, commits, uncommitted work and anything inside it are "not checked"',
+                     "gh repo view OWNER/NAME --json visibility,isArchived,pushedAt"):
+            self.assertInDoc(part, verify, name)
+
+    # round 4, item 2
+    def test_docs_fix_mode_needs_a_working_backup(self):
+        docs = self.docs()
+        name = os.path.join("references", "verify-agent.md")
+        verify = docs[name]
+        self.assertInDoc("{BACKUP}", verify, name)
+        self.assertInDoc("none: propose only", verify, name)
+        self.assertFalse("a backup was made" in verify, name)
+        for doc in (name, "SKILL.md"):
+            self.assertInDoc("backup_failed: false", docs[doc], doc)
+
+    # round 4, item 4
+    def test_scheduled_run_starts_in_the_data_folder(self):
+        self.assertInDoc('cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/token-checkup" && claude -p',
+                         self.docs()["SKILL.md"], "SKILL.md")
+
+    # round 4, item 2
+    def test_failed_copy_never_rotates_older_copies(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a.md"), "x\n")
+        good = [memory_check.backup(mem)["path"] for _ in range(4)]
+        self.assertTrue(all(os.path.isdir(g) for g in good))
+
+        def copy(src, dst, **kw):
+            raise PermissionError(13, "Permission denied", src)
+
+        with mock.patch.object(memory_check.shutil, "copy2", side_effect=copy):
+            res = memory_check.backup(mem)
+        self.assertIs(res["failed"], True)
+        self.assertTrue(all(os.path.isdir(g) for g in good))
+        self.assertTrue(any("rotation skipped" in n for n in res["notes"]))
+
+    def test_any_copy_or_walk_error_fails_the_backup(self):
+        mem = self.mem()
+        for i in range(13):
+            self.write(os.path.join(mem, f"m{i:02}.md"), "x\n")
+        real_copy, real_walk = shutil.copy2, os.walk
+
+        def copy(src, dst, **kw):  # every file but the first cannot be copied
+            if os.path.basename(src) != "m00.md":
+                raise PermissionError(13, "Permission denied", src)
+            return real_copy(src, dst, **kw)
+
+        def walk(top, onerror=None, **kw):  # a folder that cannot be listed
+            onerror(PermissionError(13, "Permission denied", os.path.join(top, "sub")))
+            yield from real_walk(top, onerror=onerror, **kw)
+
+        with mock.patch.object(memory_check.shutil, "copy2", side_effect=copy):
+            res = memory_check.backup(mem)
+        self.assertEqual((res["files"], len(res["errors"])), (1, 12))
+        self.assertTrue(os.path.isdir(res["path"]))
+        self.assertIs(res["failed"], True)
+        with mock.patch.object(memory_check.os, "walk", side_effect=walk):
+            res = memory_check.backup(mem)
+        self.assertEqual((res["files"], len(res["errors"])), (13, 1))
+        self.assertIs(res["failed"], True)
+        os.makedirs(common.data_dir(), exist_ok=True)
+        self.write(os.path.join(common.data_dir(), "config.json"), json.dumps({"auto_fix_memory": True}))
+
+        def run(*args, fail=True):
+            out = io.StringIO()
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    sys, "argv", ["memory_check.py", "--project=-tmp-demo", "--backup", *args]))
+                if fail:
+                    stack.enter_context(mock.patch.object(memory_check.shutil, "copy2", side_effect=copy))
+                stack.enter_context(redirect_stdout(out))
+                memory_check.main()
+            return out.getvalue()
+
+        text = run()
+        self.assertIn("Backup FAILED (12 errors): ", text)
+        self.assertIn("; and 2 more.", text)
+        self.assertIn("Do not edit any memory file in this run", text)
+        self.assertIn("MODE propose", text)
+        self.assertNotIn("MODE fix", text)
+        r = json.loads(run("--json"))
+        self.assertIs(r["backup_failed"], True)
+        self.assertEqual(len(r["backup_errors"]), 12)
+        self.assertEqual(r["fact_check_mode"], "propose")
+        text = run(fail=False)
+        self.assertNotIn("FAILED", text)
+        self.assertIn("MODE fix", text)
+        r = json.loads(run("--json", fail=False))
+        self.assertEqual((r["backup_failed"], r["fact_check_mode"]), (False, "fix"))
+
+    # round 4, item 3
+    def test_future_dated_backups_rotate_out(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a.md"), "a\n")
+        root = os.path.join(common.data_dir(), "backups", "memory", "-tmp-demo")
+        future = time.time() + 10 * 365 * 86400
+        for i in range(3):
+            d = os.path.join(root, f"2000010{i + 1}-000000-000000")
+            os.makedirs(d)
+            os.utime(d, (future, future))
+        paths = [memory_check.backup(mem)["path"] for _ in range(5)]
+        stamped = sorted(n for n in os.listdir(root) if STAMPED_MEMORY.fullmatch(n))
+        self.assertEqual(stamped, sorted(os.path.basename(p) for p in paths[-4:]))
+
+    # round 4, item 5
+    def test_home_is_not_checked_on_macos(self):
+        mem = self.mem()
+        path = "/home/someone/x.txt"
+        self.write(os.path.join(mem, "h.md"), f"---\ntype: project\n---\nsee `{path}`\n")
+        seen = []
+
+        def fake_exists(p):  # never touch the real /home, which macOS automounts
+            seen.append(os.fspath(p))
+            return False
+
+        for platform, odd in (("darwin", [path]), ("linux", [])):
+            seen.clear()
+            with mock.patch.object(sys, "platform", platform), mock.patch("os.path.exists", side_effect=fake_exists):
+                row = self.rows()["h.md"]
+            self.assertEqual(row["unusual_paths"], odd, platform)
+            self.assertEqual(path in seen, not odd, platform)
+            self.assertEqual([p["written"] for p in row["dead_paths"]], [] if odd else [path], platform)
 
     # round 3, item 5
     def test_dotdot_and_network_paths_are_not_checked(self):

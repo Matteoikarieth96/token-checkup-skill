@@ -10,8 +10,9 @@ For the memory folder (~/.claude/projects/<key>/memory) it reports:
   - per memory: size, type, last "Verified/Verificato YYYY-MM-DD" date (invalid and future dates
     are ignored), changes since then, paths quoted in backticks that no longer exist (as written
     and with "~" expanded), path text that looks unusual (reported, never checked: shell or
-    control characters, a ".." component, or a path under /net, /Network, /Volumes or /mnt, so
-    a memory cannot trigger an automount or a network lookup), [[links]] to memories that are gone
+    control characters, a ".." component, or a path under /net, /Network, /Volumes or /mnt, and
+    on macOS /home, so a memory cannot trigger an automount or a network lookup), [[links]] to
+    memories that are gone
   - which memories need a fact check by an agent (never verified, verified long ago, or changed
     since), and which wait for the user (a line starting with "**Needs user")
   - archive candidates: project memories no session mentioned for N days (never rules or user notes)
@@ -19,9 +20,11 @@ For the memory folder (~/.claude/projects/<key>/memory) it reports:
 Only regular *.md files count: symlinks and folders are skipped. It changes nothing unless
 --backup is given, which copies the regular *.md files of the folder (subfolders too, symlinks
 never followed) to <data dir>/backups/memory/<project key>/<timestamp> and keeps the last four
-copies of that project, by modification time, never deleting the new one. It refuses to back up
-when backups, backups/memory or the project's backup folder is a symlink. A failed backup is
-printed as "Backup FAILED". Flat backups/memory-* folders of earlier versions are left alone.
+copies of that project, by modification time (a time in the future counts as the oldest), never
+deleting the new one. It refuses to back up when backups, backups/memory or the project's backup
+folder is a symlink. Any copy or folder-walk error fails the backup: it is printed as
+"Backup FAILED" with every error counted, --json gives "backup_failed": true, and the fact-check
+mode is "propose". Flat backups/memory-* folders of earlier versions are left alone.
 
 Usage:
   memory_check.py --project <folder> [--json] [--backup]
@@ -51,6 +54,7 @@ TYPE = re.compile(r"^[ \t]*type:[ \t]*[\"']?([A-Za-z_-]+)", re.M)
 SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 UNUSUAL = set("$`;&|()<>")
 NETWORK_ROOTS = ("/net", "/network", "/volumes", "/mnt")  # compared case-insensitively
+MACOS_ROOTS = ("/home",)  # automounted by auto_home on macOS
 PLAIN_LINE = re.compile(r"- \[[^\[\]`\n]{1,300}\]\([^()\s`\[\]]{1,200}\.md\)[^\[\]`\n]{0,2000}")
 URLISH = re.compile(r"://|www\.", re.I)
 BACKUP_NAME = re.compile(r"\d{8}-\d{6}-\d{6}(?:-\d+)?")
@@ -83,12 +87,17 @@ def check_target(path_text):
     return os.path.expanduser(path_text.rstrip("/.,;:"))
 
 
+def network_roots():
+    """Roots that can automount or reach the network: /home too on macOS (auto_home)."""
+    return NETWORK_ROOTS + (MACOS_ROOTS if sys.platform == "darwin" else ())
+
+
 def unusual(path_text):
     """True for path text that is reported and never checked.
 
     That is text with shell or control characters, a ".." component once "~" is expanded,
-    or a path under /net, /Network, /Volumes or /mnt, so that a memory cannot make the
-    check trigger an automount or a network lookup.
+    or a path under /net, /Network, /Volumes or /mnt, and on macOS /home, so that a memory
+    cannot make the check trigger an automount or a network lookup.
     """
     if any(c in UNUSUAL or unicodedata.category(c) == "Cc" for c in path_text):
         return True
@@ -97,7 +106,7 @@ def unusual(path_text):
     norm = os.path.normpath(check_target(path_text)).casefold()
     if norm.startswith("/"):
         norm = "/" + norm.lstrip("/")
-    return any(norm == root or norm.startswith(root + "/") for root in NETWORK_ROOTS)
+    return any(norm == root or norm.startswith(root + "/") for root in network_roots())
 
 
 def resolve_link(mem, link):
@@ -248,10 +257,13 @@ def backup(mem, key=None):
     Symlinks are never followed. If backups, backups/memory or backups/memory/<key> is a
     symlink, nothing is created and the backup fails. Errors are collected, not raised.
     Rotation keeps the last KEEP_BACKUPS copies of this project: the new copy plus the
-    newest older ones by modification time. It never deletes the new copy, and deletes only
-    timestamp-named folders of this project; other projects, other names and the flat
-    backups/memory-* folders of earlier versions are never touched. "failed" is true when
-    there is no new copy left at the end.
+    newest older ones by modification time, where a time in the future counts as the
+    oldest, so a future-dated folder rotates out instead of staying forever. It never
+    deletes the new copy, and deletes only timestamp-named folders of this project; other
+    projects, other names and the flat backups/memory-* folders of earlier versions are
+    never touched. "failed" is true when any copy or folder-walk error happened, or when
+    there is no new copy left at the end. A rotation error goes to "notes" and does not
+    fail the backup: the new copy is complete.
     """
     key = key or os.path.basename(os.path.dirname(os.path.normpath(mem)))
     if key in ("", ".", "..") or os.sep in key or "\0" in key:
@@ -260,7 +272,7 @@ def backup(mem, key=None):
     levels += [os.path.join(levels[0], "memory"), os.path.join(levels[0], "memory", key)]
 
     def failed(msg):
-        return {"path": None, "files": 0, "errors": [msg], "failed": True}
+        return {"path": None, "files": 0, "errors": [msg], "notes": [], "failed": True}
 
     links = [p for p in levels if os.path.islink(p)]
     if links:
@@ -301,7 +313,7 @@ def backup(mem, key=None):
                 copied += 1
             except OSError as e:
                 errors.append(f"{clean(rel)}: {e.strerror or e}")
-    new = os.path.basename(dest)
+    new, notes, now = os.path.basename(dest), [], time.time_ns()
     try:
         old = []
         for d in os.listdir(root):
@@ -311,17 +323,18 @@ def backup(mem, key=None):
                 st = os.lstat(os.path.join(root, d))
             except OSError:
                 continue
-            if stat.S_ISDIR(st.st_mode):
-                old.append((st.st_mtime_ns, d))
+            if stat.S_ISDIR(st.st_mode):  # a time in the future counts as the oldest
+                old.append((st.st_mtime_ns if st.st_mtime_ns <= now else 0, d))
         old.sort()
-        for _, d in old[:max(0, len(old) - (KEEP_BACKUPS - 1))]:
+        for _, d in ([] if errors else old[:max(0, len(old) - (KEEP_BACKUPS - 1))]):
             shutil.rmtree(os.path.join(root, d), ignore_errors=True)
     except OSError as e:
-        errors.append(f"rotation: {e.strerror or e}")
-    gone = os.path.islink(dest) or not os.path.isdir(dest)
-    if gone:
+        notes.append(f"rotation: {e.strerror or e}; older copies were kept")
+    if errors:
+        notes.append("rotation skipped: this copy failed, so every older copy was kept")
+    if os.path.islink(dest) or not os.path.isdir(dest):
         errors.append("the new backup is missing after rotation")
-    return {"path": dest, "files": copied, "errors": errors, "failed": gone}
+    return {"path": dest, "files": copied, "errors": errors, "notes": notes, "failed": bool(errors)}
 
 
 def main():
@@ -339,7 +352,10 @@ def main():
     if a.backup:
         b = backup(r["memory_dir"], os.path.basename(pdir))
         r["backup"], r["backup_files"], r["backup_errors"] = b["path"], b["files"], b["errors"]
-        r["backup_failed"] = b["failed"]
+        r["backup_notes"], r["backup_failed"] = b["notes"], b["failed"]
+    # agents may edit memory files only after a backup in this run that had no error
+    backed_up = a.backup and not r["backup_failed"]
+    r["fact_check_mode"] = "fix" if r["auto_fix_memory"] and backed_up else "propose"
     if a.json:
         print(json.dumps(r, indent=1))
         return
@@ -350,16 +366,26 @@ def main():
 
     print(f"Memory: {len(m)} files, {sum(x['chars'] for x in m)} chars; MEMORY.md {r['index_chars']} chars, "
           f"{r['index_entries']} entries")
-    print("Fact fixes: " + ("applied by the fact-check agents (auto_fix_memory true)" if r["auto_fix_memory"]
-                            else "proposals only (auto_fix_memory false)"))
+    if not r["auto_fix_memory"]:
+        why = "auto_fix_memory false: proposals only"
+    elif not a.backup:
+        why = "no backup in this run: run with --backup to allow fixes"
+    elif r["backup_failed"]:
+        why = "the backup failed: proposals only"
+    else:
+        why = "auto_fix_memory true and the backup worked"
+    print(f"Fact fixes: MODE {r['fact_check_mode']} ({why})")
     if a.backup and r["backup_failed"]:
-        print("Backup FAILED: " + "; ".join(clean(e, 400) for e in r["backup_errors"][:10])
+        errs = r["backup_errors"]
+        more = f"; and {len(errs) - 10} more" if len(errs) > 10 else ""
+        print(f"Backup FAILED ({len(errs)} error{'s' if len(errs) != 1 else ''}): "
+              + "; ".join(clean(e, 400) for e in errs[:10]) + more
               + ". Do not edit any memory file in this run.")
     elif a.backup:
         print(f"Backup: {r['backup']} ({r['backup_files']} files)")
-        if r["backup_errors"]:
-            print("Backup errors, these files were not backed up: "
-                  + "; ".join(clean(e) for e in r["backup_errors"][:10]))
+    if a.backup and r["backup_notes"]:
+        print("Backup rotation: " + "; ".join(clean(e, 400) for e in r["backup_notes"]))
+
     def lines(items):
         shown = [f"line {x['line']} ({names(x['broken'])})" for x in items[:20]]
         return "; ".join(shown) + (f"; and {len(items) - 20} more (see --json)" if len(items) > 20 else "")

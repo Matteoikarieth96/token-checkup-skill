@@ -31,7 +31,7 @@ a fraction of fresh input. It is an estimate, and your numbers will differ: the 
 | --- | --- |
 | `scripts/measure.py` | First-call context (also by Claude Code version), peak size, compactions, mean context per call, cache reads, tools that fill sessions. Week over week and against a saved baseline. `--simulate N` estimates what compaction at N tokens would save. |
 | `scripts/audit_start.py` | What you control at session start (CLAUDE.md files, memory index, skill descriptions, hooks, compaction settings) and what grew in what transcripts record before the first answer. |
-| `scripts/memory_check.py` | Memory index problems, missing paths, dead links, memories due for a fact check or waiting for your answer, archive and split candidates. It never edits the index. Optional backup, keeping the last four per project. |
+| `scripts/memory_check.py` | Memory index problems, missing paths, dead links, memories due for a fact check or waiting for your answer, archive and split candidates. It never edits the index. Optional backup, keeping the last four per project; a backup with any copy error counts as failed, and then no memory file is edited. |
 | `scripts/context_guard.py` | `UserPromptSubmit` hook: the first time a session passes 250k, 400k, 550k, 700k and 850k tokens, it asks Claude to open its reply with one line (a request, not guaranteed). |
 | `scripts/setup.py` | Installs or removes the hook and `"autoCompactWindow"` in your user-level settings, backing up settings and restoring your previous value on uninstall. |
 
@@ -41,8 +41,9 @@ a fraction of fresh input. It is an estimate, and your numbers will differ: the 
 
 What it never does: change the memory index, archive, move or delete memories, edit a CLAUDE.md, or
 change settings, hooks or connectors without your yes; fix facts in memory files unless you enabled
-that at setup and the backup of that run worked; run git; block a prompt. The context guard asks
-Claude to open its reply with one line; that is a request to the model, not guaranteed.
+that at setup and the backup of that run copied every file; look inside a repository; run git;
+block a prompt. The context guard asks Claude to open its reply with one line; that is a request to
+the model, not guaranteed.
 
 ## Where it looks
 
@@ -90,12 +91,13 @@ In Claude Code, just ask:
 Everything runs locally. The scripts read transcripts and memory under `~/.claude` (or
 `$CLAUDE_CONFIG_DIR`) and write only to `~/.claude/token-checkup/` and, on install or uninstall, to
 `~/.claude/settings.json`. The scripts never touch the network. Claude and its subagents read the
-files they check, as in any Claude Code session. No run uses git: for a local repo, the fact checks
-only read the plain file `.git/HEAD` for the branch name. Only when you are present, they may run
-one `gh repo view --json` command; scheduled runs make no gh calls. Path text with a `..` component
-or under `/net/`, `/Network/`, `/Volumes/` or `/mnt/` is reported, never checked. A scheduled
-`claude -p` run is allowed to read only the project's transcript folder, the data folder and the
-skill folder. Reports hold numbers, file names and questions from the fact checks, never secrets.
+files they check, as in any Claude Code session. No run uses git, and the fact checks never look
+inside a repository: for a local repo they only check that the folder exists. Only when you are
+present, they may run one `gh repo view --json` command; scheduled runs make no gh calls. Path text
+with a `..` component or under `/net/`, `/Network/`, `/Volumes/` or `/mnt/` (and `/home/` on macOS)
+is reported, never checked. A scheduled `claude -p` run starts in the data folder and is allowed to
+read only the project's transcript folder, the data folder and the skill folder. Reports hold
+numbers, file names and questions from the fact checks, never secrets.
 Details and residual risks: [SECURITY.md](SECURITY.md).
 
 ## Limitations

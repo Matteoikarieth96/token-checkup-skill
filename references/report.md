@@ -39,6 +39,6 @@ broken link to remove from each mixed line, lines for orphan files, shorter vers
 - <from the fact checks and the memories waiting for the user>
 
 ## Not checked
-- <anything skipped and why: no memory folder, unusual path text, the last commit and uncommitted
-  work of local repos (never checked), GitHub claims in an unattended run, ...>
+- <anything skipped and why: no memory folder, unusual path text, the branch, commits, uncommitted
+  work and contents of local repos (never checked), GitHub claims in an unattended run, ...>
 ```
