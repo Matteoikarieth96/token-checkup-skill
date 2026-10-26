@@ -31,7 +31,7 @@ a fraction of fresh input. It is an estimate, and your numbers will differ: the 
 | --- | --- |
 | `scripts/measure.py` | First-call context (also by Claude Code version), peak size, compactions, mean context per call, cache reads, tools that fill sessions. Week over week and against a saved baseline. `--simulate N` estimates what compaction at N tokens would save. |
 | `scripts/audit_start.py` | What you control at session start (CLAUDE.md files, memory index, skill descriptions, hooks, compaction settings) and what grew in what transcripts record before the first answer. |
-| `scripts/memory_check.py` | Memory index problems, missing paths, dead links, memories due for a fact check or waiting for your answer, archive and split candidates. Optional backup. |
+| `scripts/memory_check.py` | Memory index problems, missing paths, dead links, memories due for a fact check or waiting for your answer, archive and split candidates. It never edits the index. Optional backup, keeping the last four per project. |
 | `scripts/context_guard.py` | `UserPromptSubmit` hook: the first time a session passes 250k, 400k, 550k, 700k and 850k tokens, it asks Claude to open its reply with one line (a request, not guaranteed). |
 | `scripts/setup.py` | Installs or removes the hook and `"autoCompactWindow"` in your user-level settings, backing up settings and restoring your previous value on uninstall. |
 
@@ -39,10 +39,10 @@ a fraction of fresh input. It is an estimate, and your numbers will differ: the 
   memories that changed or are due, so the checkup costs far less than it saves.
 - Hands over a one-page report with week-over-week numbers, what was fixed, and numbered proposals.
 
-What it never does: archive, move or delete memories, edit a CLAUDE.md, or change settings, hooks or
-connectors without your yes; fix facts in memory files unless you enabled that at setup; block a
-prompt. The context guard asks Claude to open its reply with one line; that is a request to the
-model, not guaranteed.
+What it never does: change the memory index, archive, move or delete memories, edit a CLAUDE.md, or
+change settings, hooks or connectors without your yes; fix facts in memory files unless you enabled
+that at setup and the backup of that run worked; run git; block a prompt. The context guard asks
+Claude to open its reply with one line; that is a request to the model, not guaranteed.
 
 ## Where it looks
 
@@ -71,7 +71,8 @@ Requirements:
 
 - Claude Code (tested with 2.1.304 and 2.1.308), with auto-memory for the memory checks
 - Python 3.9 or newer, standard library only
-- git and `gh` are optional: the fact checks use them only in runs where you are present
+- `gh` is optional: the fact checks use it only in runs where you are present. The skill never
+  runs git.
 - macOS or Linux
 
 ## Usage
@@ -89,11 +90,13 @@ In Claude Code, just ask:
 Everything runs locally. The scripts read transcripts and memory under `~/.claude` (or
 `$CLAUDE_CONFIG_DIR`) and write only to `~/.claude/token-checkup/` and, on install or uninstall, to
 `~/.claude/settings.json`. The scripts never touch the network. Claude and its subagents read the
-files they check, as in any Claude Code session. Only when you are present, they may run one fixed
-read-only `git log` command and one `gh repo view --json` command; scheduled runs run no git or gh.
-Reports
-hold numbers, file names and questions from the fact checks, never secrets. Details and residual
-risks: [SECURITY.md](SECURITY.md).
+files they check, as in any Claude Code session. No run uses git: for a local repo, the fact checks
+only read the plain file `.git/HEAD` for the branch name. Only when you are present, they may run
+one `gh repo view --json` command; scheduled runs make no gh calls. Path text with a `..` component
+or under `/net/`, `/Network/`, `/Volumes/` or `/mnt/` is reported, never checked. A scheduled
+`claude -p` run is allowed to read only the project's transcript folder, the data folder and the
+skill folder. Reports hold numbers, file names and questions from the fact checks, never secrets.
+Details and residual risks: [SECURITY.md](SECURITY.md).
 
 ## Limitations
 

@@ -2,21 +2,26 @@
 
 For the memory folder (~/.claude/projects/<key>/memory) it reports:
   - index problems in MEMORY.md: long lines, files missing from the index, links to files that
-    do not exist (%xx decoded first), links that point outside the memory folder. A line is to
-    drop only when every link on it is broken; a line with a broken link and another link is
-    "mixed" and only a proposal
+    do not exist (a link works if its raw text or its %xx-decoded text names a file inside the
+    memory folder), links that point outside the memory folder. A line with a broken link is a
+    "drop candidate" only when it is a plain "- [title](file.md) text" line with that one link
+    and no other link, [[link]], URL or backtick; any other line with a broken link is "mixed".
+    Every index change is a proposal: this script never edits MEMORY.md
   - per memory: size, type, last "Verified/Verificato YYYY-MM-DD" date (invalid and future dates
     are ignored), changes since then, paths quoted in backticks that no longer exist (as written
-    and with "~" expanded), path text that looks unusual (reported, never checked), [[links]] to
-    memories that are gone
+    and with "~" expanded), path text that looks unusual (reported, never checked: shell or
+    control characters, a ".." component, or a path under /net, /Network, /Volumes or /mnt, so
+    a memory cannot trigger an automount or a network lookup), [[links]] to memories that are gone
   - which memories need a fact check by an agent (never verified, verified long ago, or changed
     since), and which wait for the user (a line starting with "**Needs user")
   - archive candidates: project memories no session mentioned for N days (never rules or user notes)
   - split candidates: memories over N characters
 Only regular *.md files count: symlinks and folders are skipped. It changes nothing unless
---backup is given, which first copies the regular *.md files of the folder (subfolders too,
-symlinks never followed) to <data dir>/backups/memory/<project key>/<timestamp> and keeps the
-last four copies of that project. Flat backups/memory-* folders of earlier versions are left alone.
+--backup is given, which copies the regular *.md files of the folder (subfolders too, symlinks
+never followed) to <data dir>/backups/memory/<project key>/<timestamp> and keeps the last four
+copies of that project, by modification time, never deleting the new one. It refuses to back up
+when backups, backups/memory or the project's backup folder is a symlink. A failed backup is
+printed as "Backup FAILED". Flat backups/memory-* folders of earlier versions are left alone.
 
 Usage:
   memory_check.py --project <folder> [--json] [--backup]
@@ -45,6 +50,9 @@ PATH = re.compile(r"`((?:~|/Users|/home|/root|/private|/opt|/Library|/var|/tmp|/
 TYPE = re.compile(r"^[ \t]*type:[ \t]*[\"']?([A-Za-z_-]+)", re.M)
 SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 UNUSUAL = set("$`;&|()<>")
+NETWORK_ROOTS = ("/net", "/network", "/volumes", "/mnt")  # compared case-insensitively
+PLAIN_LINE = re.compile(r"- \[[^\[\]`\n]{1,300}\]\([^()\s`\[\]]{1,200}\.md\)[^\[\]`\n]{0,2000}")
+URLISH = re.compile(r"://|www\.", re.I)
 BACKUP_NAME = re.compile(r"\d{8}-\d{6}-\d{6}(?:-\d+)?")
 KEEP_TYPES = {"user", "feedback", "reference"}
 KEEP_BACKUPS = 4
@@ -70,22 +78,46 @@ def verified_date(text, today):
     return best
 
 
+def check_target(path_text):
+    """The path that is checked for a path quoted in a memory: "~" expanded, trailing punctuation cut."""
+    return os.path.expanduser(path_text.rstrip("/.,;:"))
+
+
 def unusual(path_text):
-    return any(c in UNUSUAL or unicodedata.category(c) == "Cc" for c in path_text)
+    """True for path text that is reported and never checked.
+
+    That is text with shell or control characters, a ".." component once "~" is expanded,
+    or a path under /net, /Network, /Volumes or /mnt, so that a memory cannot make the
+    check trigger an automount or a network lookup.
+    """
+    if any(c in UNUSUAL or unicodedata.category(c) == "Cc" for c in path_text):
+        return True
+    if ".." in os.path.expanduser(path_text).split("/"):
+        return True
+    norm = os.path.normpath(check_target(path_text)).casefold()
+    if norm.startswith("/"):
+        norm = "/" + norm.lstrip("/")
+    return any(norm == root or norm.startswith(root + "/") for root in NETWORK_ROOTS)
 
 
 def resolve_link(mem, link):
-    """(normalized path, inside the memory folder?) of an index link: %xx decoded, relative to the memory folder."""
-    p = os.path.normpath(os.path.join(mem, unquote(link)))
-    return p, p.startswith(mem + os.sep)
+    """[(normalized path, inside the memory folder?)] of an index link: its raw text first, then
+    its %xx-decoded text when that differs, each relative to the memory folder."""
+    out = []
+    for text in dict.fromkeys((link, unquote(link))):
+        p = os.path.normpath(os.path.join(mem, text))
+        out.append((p, p.startswith(mem + os.sep)))
+    return out
 
 
 def index_links(mem, index):
-    """Index links checked line by line.
+    """Index links checked line by line. Nothing here changes the index.
 
-    A line is to drop only when every link on it points to a missing file inside the
-    memory folder. A line with a broken link and any other link (a working one, a URL or
-    one outside the memory folder) is "mixed": a proposal, never dropped.
+    A link works when its raw or its %xx-decoded text names an existing file inside the
+    memory folder. A link that is not inside it is reported as outside and never broken.
+    A line with a broken link is a drop candidate only when it is a plain
+    "- [title](file.md) text" line with that one link and no other link, [[link]], URL or
+    backtick. Any other line with a broken link is "mixed". Both are proposals.
     """
     r = {"indexed": set(), "broken": set(), "outside": set(), "drop": [], "mixed": [], "count": 0}
     for n, line in enumerate(index.splitlines(), 1):
@@ -95,19 +127,23 @@ def index_links(mem, index):
             if SCHEME.match(link):  # a web or other URL, not a memory file
                 other.append(link)
                 continue
-            p, inside = resolve_link(mem, link)
-            if not inside:
+            cands = resolve_link(mem, link)
+            hit = next((p for p, inside in cands if inside and os.path.exists(p)), None)
+            if hit:
+                r["indexed"].add(hit)
+                other.append(link)
+            elif not all(inside for _, inside in cands):
                 r["outside"].add(link)
                 other.append(link)
-                continue
-            r["indexed"].add(p)
-            (other if os.path.exists(p) else bad).append(link)
+            else:
+                bad.append(link)
         if bad:
             r["broken"].update(bad)
-            if other:
-                r["mixed"].append({"line": n, "broken": bad, "other": other})
-            else:
+            plain = not other and PLAIN_LINE.fullmatch(line.rstrip()) and not URLISH.search(line)
+            if plain:
                 r["drop"].append({"line": n, "broken": bad})
+            else:
+                r["mixed"].append({"line": n, "broken": bad, "other": other})
     return r
 
 
@@ -163,7 +199,7 @@ def check(pdir, cfg):
         odd_paths = [p for p in found if unusual(p)]
         dead_paths = []
         for p in found:
-            full = os.path.expanduser(p.rstrip("/.,;:"))
+            full = check_target(p)
             if p not in odd_paths and not os.path.exists(full):
                 dead_paths.append({"written": p, "expanded": full})
         dead_links = [w for w in dict.fromkeys(WIKI.findall(text))
@@ -209,27 +245,41 @@ def backup(mem, key=None):
     <data dir>/backups/memory/<key>/<timestamp>.
 
     key is the project key (default: the name of the folder that holds the memory folder).
-    Symlinks are never followed. Errors are collected, not raised. Keeps the last
-    KEEP_BACKUPS timestamp folders of this project only; other projects, other names and
-    the flat backups/memory-* folders of earlier versions are never deleted.
+    Symlinks are never followed. If backups, backups/memory or backups/memory/<key> is a
+    symlink, nothing is created and the backup fails. Errors are collected, not raised.
+    Rotation keeps the last KEEP_BACKUPS copies of this project: the new copy plus the
+    newest older ones by modification time. It never deletes the new copy, and deletes only
+    timestamp-named folders of this project; other projects, other names and the flat
+    backups/memory-* folders of earlier versions are never touched. "failed" is true when
+    there is no new copy left at the end.
     """
     key = key or os.path.basename(os.path.dirname(os.path.normpath(mem)))
     if key in ("", ".", "..") or os.sep in key or "\0" in key:
         raise ValueError(f"not a project key: {key!r}")
-    root = os.path.join(data_dir(), "backups")
-    os.makedirs(root, mode=0o700, exist_ok=True)
-    for part in ("memory", key):
-        root = os.path.join(root, part)
-        os.makedirs(root, mode=0o700, exist_ok=True)
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    dest, n = os.path.join(root, stamp), 0
-    while True:
-        try:
-            os.mkdir(dest, 0o700)
-            break
-        except FileExistsError:
-            n += 1
-            dest = os.path.join(root, f"{stamp}-{n}")
+    levels = [os.path.join(data_dir(), "backups")]
+    levels += [os.path.join(levels[0], "memory"), os.path.join(levels[0], "memory", key)]
+
+    def failed(msg):
+        return {"path": None, "files": 0, "errors": [msg], "failed": True}
+
+    links = [p for p in levels if os.path.islink(p)]
+    if links:
+        return failed(f"refused: {clean(links[0], 400)} is a symlink, so nothing was backed up")
+    root = levels[-1]
+    try:
+        for p in levels:
+            os.makedirs(p, mode=0o700, exist_ok=True)
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        dest, n = os.path.join(root, stamp), 0
+        while True:
+            try:
+                os.mkdir(dest, 0o700)
+                break
+            except FileExistsError:
+                n += 1
+                dest = os.path.join(root, f"{stamp}-{n}")
+    except OSError as e:
+        return failed(f"cannot create the backup folder: {e.strerror or e}")
     copied, errors = 0, []
 
     def walk_error(e):
@@ -251,14 +301,27 @@ def backup(mem, key=None):
                 copied += 1
             except OSError as e:
                 errors.append(f"{clean(rel)}: {e.strerror or e}")
+    new = os.path.basename(dest)
     try:
-        old = sorted(d for d in os.listdir(root) if BACKUP_NAME.fullmatch(d)
-                     and os.path.isdir(os.path.join(root, d)) and not os.path.islink(os.path.join(root, d)))
-        for d in old[:-KEEP_BACKUPS]:
+        old = []
+        for d in os.listdir(root):
+            if d == new or not BACKUP_NAME.fullmatch(d):
+                continue
+            try:
+                st = os.lstat(os.path.join(root, d))
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                old.append((st.st_mtime_ns, d))
+        old.sort()
+        for _, d in old[:max(0, len(old) - (KEEP_BACKUPS - 1))]:
             shutil.rmtree(os.path.join(root, d), ignore_errors=True)
     except OSError as e:
         errors.append(f"rotation: {e.strerror or e}")
-    return {"path": dest, "files": copied, "errors": errors}
+    gone = os.path.islink(dest) or not os.path.isdir(dest)
+    if gone:
+        errors.append("the new backup is missing after rotation")
+    return {"path": dest, "files": copied, "errors": errors, "failed": gone}
 
 
 def main():
@@ -276,6 +339,7 @@ def main():
     if a.backup:
         b = backup(r["memory_dir"], os.path.basename(pdir))
         r["backup"], r["backup_files"], r["backup_errors"] = b["path"], b["files"], b["errors"]
+        r["backup_failed"] = b["failed"]
     if a.json:
         print(json.dumps(r, indent=1))
         return
@@ -288,20 +352,26 @@ def main():
           f"{r['index_entries']} entries")
     print("Fact fixes: " + ("applied by the fact-check agents (auto_fix_memory true)" if r["auto_fix_memory"]
                             else "proposals only (auto_fix_memory false)"))
-    if a.backup:
+    if a.backup and r["backup_failed"]:
+        print("Backup FAILED: " + "; ".join(clean(e, 400) for e in r["backup_errors"][:10])
+              + ". Do not edit any memory file in this run.")
+    elif a.backup:
         print(f"Backup: {r['backup']} ({r['backup_files']} files)")
         if r["backup_errors"]:
-            print("Backup errors: " + "; ".join(clean(e) for e in r["backup_errors"][:10]))
+            print("Backup errors, these files were not backed up: "
+                  + "; ".join(clean(e) for e in r["backup_errors"][:10]))
     def lines(items):
         shown = [f"line {x['line']} ({names(x['broken'])})" for x in items[:20]]
         return "; ".join(shown) + (f"; and {len(items) - 20} more (see --json)" if len(items) > 20 else "")
 
     print(f"Index: {len(r['index_long_lines'])} lines over {cfg['index_line_max']} chars; "
           f"orphans {names(r['orphans'])}; broken links {names(r['broken_index_links'])}")
-    print("Index lines to drop, every link on them broken: " + (lines(r["index_lines_to_drop"]) or "none"))
+    print("Index changes are proposals: nothing in MEMORY.md changes without the user's yes.")
+    print("Index drop candidates, one plain link and it is broken (a proposal): "
+          + (lines(r["index_lines_to_drop"]) or "none"))
     if r["mixed_index_lines"]:
-        print("Mixed index lines, some links broken and some not (a proposal, not dropped): "
-              + lines(r["mixed_index_lines"]))
+        print("Mixed index lines, a broken link next to other text or links (a proposal: remove only the "
+              "broken link): " + lines(r["mixed_index_lines"]))
     if r["outside_index_links"]:
         print("Index links outside the memory folder (left alone): " + names(r["outside_index_links"]))
     if r["unreadable"]:

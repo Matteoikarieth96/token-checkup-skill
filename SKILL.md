@@ -52,25 +52,29 @@ project folder in its prompt, so it skips this step.
 - **Cheaper than what it saves.** Scripts do the counting. Agents only fact-check the memories that
   `memory_check.py` flags, at most 12 per run, at most 2 agents, on a small model. Never re-verify
   every memory in a weekly run.
-- **What runs without asking:** measuring, writing the report, memory backups, and one index fix:
-  dropping an index line when every link on it points to a file that does not exist (links are
-  %xx-decoded and resolved inside the memory folder). A "mixed" line, with a broken link and a
-  link that works, is never dropped: it is a proposal.
+- **What runs without asking:** measuring, writing the report and memory backups. Nothing changes
+  the memory index (`MEMORY.md`) on its own.
   Fact fixes inside memory files run without asking only when `auto_fix_memory` is true (proved by
   a check, each file ending with a `Verified YYYY-MM-DD` line). `auto_fix_memory` is false by
   default and becomes true only when the user says yes at setup; while it is false, fact-check
   results are proposals.
-- **What needs the user's yes in chat, every time:** adding index lines for orphan files, fixing
-  mixed index lines, shortening long index lines, archiving, moving or deleting memories, splitting
-  a memory, editing any CLAUDE.md, changing settings, hooks, thresholds or connectors. A scheduled
-  run leaves these as proposals.
+- **What needs the user's yes in chat, every time:** every index change (dropping a line with a
+  broken link, removing a broken link from a mixed line, adding a line for an orphan file,
+  shortening a long line), archiving, moving or deleting memories, splitting a memory, editing any
+  CLAUDE.md, changing settings, hooks, thresholds or connectors. A scheduled run leaves these as
+  proposals.
 - Back up before touching memory: the `--backup` flag of `memory_check.py` does it (weekly step 3)
   in `~/.claude/token-checkup/backups/memory/<key>/` and keeps the last four copies of that project.
-- **git and gh only when the user is present.** Fact-check agents may run one fixed `git log` and
-  one `gh repo view --json` command, exactly as `references/verify-agent.md` writes them. They never
-  run `git status`, so uncommitted work is always reported as "not checked". Scheduled (unattended)
-  runs run no git and no gh at all: they check paths only and report git and GitHub claims as "not
-  checked".
+  **If the backup failed** (the output says `Backup FAILED`), do not edit any memory file in this
+  run: every fact fix becomes a proposal, and the report says why. Files listed under
+  `Backup errors` were not copied: do not edit them.
+- **No git, ever; gh only when the user is present.** No run uses git: a repository's own config can
+  make even a read-only git command run programs. For a local repo, fact-check agents only check
+  that the folder exists and read the plain file `<dir>/.git/HEAD` for the current branch; the last
+  commit, uncommitted work and anything else about the repo are reported as "not checked". When the
+  user is present, agents may run one `gh repo view OWNER/NAME --json visibility,isArchived,pushedAt`
+  command, exactly as `references/verify-agent.md` writes it. Scheduled (unattended) runs run no gh
+  at all and report GitHub claims as "not checked".
 - Reply in the user's language. Say what is measured, what is estimated, and what was not checked.
 
 ## Setup (first run, or when the user asks)
@@ -125,7 +129,9 @@ project folder in its prompt, so it skips this step.
    Check CLAUDE.md sizes and the longest skill descriptions. If it shows a compaction env override,
    tell the user.
 3. **Memory:** `python3 "<skill dir>/scripts/memory_check.py" --project "<project folder>" --backup`.
-   If it says the project has no memory folder, skip this step and say so in the report.
+   If it says the project has no memory folder, skip this step and say so in the report. If it says
+   `Backup FAILED`, do not edit any memory file in this run: run the fact checks with MODE `propose`
+   and put the failure at the top of the report.
    - Fact-check the memories under "Need a fact check" with up to 2 subagents, using
      `references/verify-agent.md` with MODE `fix` when `auto_fix_memory` is true and `propose` when
      it is false (the script prints which), and RUN `interactive` when the user is in the session or
@@ -133,14 +139,17 @@ project folder in its prompt, so it skips this step.
      oldest verification. Max 12. Missing paths are shown with `~` expanded; pass them that way.
    - Memories "waiting for the user" end with a `**Needs user` question: put it in the report's
      questions; do not send them to an agent.
-   - Index: drop the lines under "Index lines to drop" (every link on them is broken). "Mixed"
-     lines (a broken link next to one that works), orphans and long lines become proposals. Links
-     outside the memory folder are left alone; mention them.
-   - "Unusual path text" is reported, never run or opened: mention it in the report.
+   - Index: change nothing. Lines under "Index drop candidates" (one plain link, broken), "mixed"
+     lines (a broken link next to other text or links), orphans and long lines all become
+     proposals. Links outside the memory folder are left alone; mention them.
+   - "Unusual path text" (shell or control characters, a `..` component, or a path under `/net/`,
+     `/Network/`, `/Volumes/` or `/mnt/`) is reported, never run, opened or checked: mention it in
+     the report.
 4. **Proposals** (numbered, each with the exact change and a rough saving):
    - fact fixes the agents found, when `auto_fix_memory` is false.
-   - index lines for orphan files, shorter versions of long index lines (keeping any hard rule),
-     and for each mixed index line the broken link to remove.
+   - index changes: each drop candidate line to remove, for each mixed index line the broken link
+     to remove, index lines for orphan files, and shorter versions of long index lines (keeping any
+     hard rule).
    - archive candidates: move to `memory/../memory-archive/<date>/`, list them with one line each in
      a `memory-archive.md` memory, remove their index lines. Never propose rules (`feedback`),
      user notes (`user`) or references.
@@ -151,7 +160,7 @@ project folder in its prompt, so it skips this step.
 5. **Report:** write `~/.claude/token-checkup/reports/<YYYY-MM-DD>.md` from `references/report.md`.
    In chat: one-sentence headline, 3 to 5 numbers with week-over-week change, what was fixed, the
    numbered proposals, and one question: which proposals to apply.
-6. When the user approves, apply exactly those, re-run
+6. When the user approves, apply exactly those (none that edit memory if the backup failed), re-run
    `python3 "<skill dir>/scripts/memory_check.py" --project "<project folder>"`, and confirm in a line.
 
 ## Reading the numbers
@@ -170,34 +179,40 @@ project folder in its prompt, so it skips this step.
   9:00, local time) and the prompt below. Tell the user that scheduled tasks run while the app is
   open and the computer is awake; a run missed during sleep happens once, late.
 - **Elsewhere** (cron, launchd): the user's own scheduler runs `claude -p` with the prompt below.
-  Allow only what the run needs, with `--allowedTools`: the three scripts by absolute path, Read,
-  and edits limited to the memory folder and the report folder. For example, with the absolute
-  skill folder and the project key filled in (use `$CLAUDE_CONFIG_DIR` instead of `~/.claude` if
-  it is set):
+  Allow only what the run needs, with `--allowedTools`: the three scripts by absolute path, Read
+  limited to the project's transcript folder (which holds `memory/`), the data folder and the skill
+  folder, and edits limited to the memory folder and the report folder. For example, with the
+  absolute skill folder and the project key filled in (use `$CLAUDE_CONFIG_DIR` instead of
+  `~/.claude` if it is set). In the Read and Edit rules, write `<skill dir>` starting with `~/`, or
+  with `//` for an absolute path (for example `Read(//opt/skills/token-checkup/**)`): there, a
+  single leading `/` means a path relative to the project, not an absolute one.
 
   ```bash
   claude -p "<scheduled run prompt>" --allowedTools \
     'Bash(python3 "<skill dir>/scripts/measure.py":*)' \
     'Bash(python3 "<skill dir>/scripts/audit_start.py":*)' \
     'Bash(python3 "<skill dir>/scripts/memory_check.py":*)' \
-    'Read' \
+    'Read(~/.claude/projects/<key>/**)' \
+    'Read(~/.claude/token-checkup/**)' \
+    'Read(<skill dir>/**)' \
     'Edit(~/.claude/projects/<key>/memory/**)' \
     'Edit(~/.claude/token-checkup/reports/**)'
   ```
 
-  Never allow generic rules such as `Bash(python3:*)`, `Bash(git:*)` or `Bash(gh:*)`, and never use
-  `--dangerously-skip-permissions`: the run reads untrusted transcript text.
-- **Scheduled runs do no git or gh checks.** Nobody is there to watch them, so they check paths
-  only and report git and GitHub claims as "not checked". Run the checkup by hand when those checks
-  matter.
+  Do not add any other tool or rule. Never allow a bare `Read`, generic rules such as
+  `Bash(python3:*)`, `Bash(git:*)` or `Bash(gh:*)`, and never use `--dangerously-skip-permissions`:
+  the run reads untrusted transcript text.
+- **Scheduled runs do no gh checks, and no run uses git.** Nobody is there to watch a scheduled
+  run, so it checks paths only and reports GitHub claims as "not checked". Run the checkup by hand
+  when those checks matter.
 
 ## Scheduled run prompt
 
 Use this, filling in the project folder and the skill folder, when creating the weekly task:
 
 > Run the token-checkup skill in weekly mode for the Claude Code project folder `<project folder>`.
-> This is an unattended run: run no git and no gh commands, and give fact-check agents RUN
-> `unattended`.
+> This is an unattended run: run no git and no gh commands, give fact-check agents RUN
+> `unattended`, and change nothing in `MEMORY.md`.
 > Run each of its scripts as `python3 "<skill dir>/scripts/<script>.py" --project "<project folder>"`.
 > Apply only what the skill allows without asking, write the report file, and end with the chat
 > summary and the numbered proposals. Do not apply any proposal: the user will answer in this

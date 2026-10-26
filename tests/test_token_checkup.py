@@ -535,6 +535,63 @@ class MemoryTests(Base):
         self.assertEqual(os.path.dirname(first), os.path.join(root, "-tmp-demo"))
         self.assertEqual(len(os.listdir(os.path.join(root, "-tmp-other"))), 4)
 
+    # round 3, item 3
+    def test_rotation_never_deletes_the_new_backup(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a.md"), "a\n")
+        root = os.path.join(common.data_dir(), "backups", "memory", "-tmp-demo")
+        now, future = time.time(), []
+        for i in range(4):
+            d = os.path.join(root, f"2999010{i + 1}-000000-000000")
+            os.makedirs(d)
+            os.utime(d, (now - 100 + i, now - 100 + i))
+            future.append(d)
+        res = memory_check.backup(mem)
+        self.assertTrue(os.path.isfile(os.path.join(res["path"], "a.md")))
+        self.assertIs(res.get("failed"), False)
+        self.assertEqual(len([n for n in os.listdir(root) if STAMPED_MEMORY.fullmatch(n)]), 4)
+        self.assertFalse(os.path.exists(future[0]))  # the oldest by modification time goes
+        self.assertTrue(all(os.path.isdir(d) for d in future[1:]))
+
+    def test_symlinked_backup_folders_are_refused(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a.md"), "a\n")
+        backups = os.path.join(common.data_dir(), "backups")
+        levels = (os.path.join(backups, "memory", "-tmp-demo"), os.path.join(backups, "memory"), backups)
+        for i, level in enumerate(levels):
+            shutil.rmtree(common.data_dir(), ignore_errors=True)
+            os.makedirs(os.path.dirname(level))
+            elsewhere = os.path.join(self.tmp, f"elsewhere-{i}")
+            os.makedirs(elsewhere)
+            os.symlink(elsewhere, level)
+            res = memory_check.backup(mem)
+            self.assertIs(res.get("failed"), True, level)
+            self.assertTrue(res["errors"], level)
+            self.assertEqual(os.listdir(elsewhere), [], level)
+        proc = self.run_script("memory_check.py", "--project=-tmp-demo", "--backup")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Backup FAILED", proc.stdout)
+        self.assertIn("Do not edit any memory file in this run", proc.stdout)
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "elsewhere-2")), [])
+
+    def test_backup_gone_after_rotation_is_a_failure(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a.md"), "a\n")
+        root = os.path.join(common.data_dir(), "backups", "memory", "-tmp-demo")
+        for i in range(4):
+            os.makedirs(os.path.join(root, f"2000010{i + 1}-000000-000000"))
+        real = shutil.rmtree
+
+        def wipe(path, *args, **kw):  # a rotation that removes everything, the new copy too
+            for name in os.listdir(os.path.dirname(path)):
+                real(os.path.join(os.path.dirname(path), name), ignore_errors=True)
+
+        with mock.patch.object(memory_check.shutil, "rmtree", side_effect=wipe):
+            res = memory_check.backup(mem)
+        self.assertFalse(os.path.exists(res["path"]))
+        self.assertIs(res.get("failed"), True)
+        self.assertTrue(res["errors"])
+
     # round 2, item 4
     def test_tilde_dead_paths_are_reported_expanded(self):
         mem = self.mem()
@@ -562,15 +619,75 @@ class MemoryTests(Base):
         mem = self.mem()
         self.write(os.path.join(mem, "a.md"), "a\n")
         self.write(os.path.join(mem, "MEMORY.md"),
-                   "- [A](a.md): see also [G](gone.md)\n- [X](gone2.md): x [Y](gone3.md)\n")
+                   "- [A](a.md): see also [G](gone.md)\n- [X](gone2.md): x [Y](gone3.md)\n"
+                   "- [Z](gone4.md): a plain hook\n")
         r = memory_check.check(self.pdir, common.config())
-        self.assertEqual([x["line"] for x in r.get("mixed_index_lines", [])], [1])
-        self.assertEqual([x["line"] for x in r.get("index_lines_to_drop", [])], [2])
-        self.assertEqual(r["broken_index_links"], ["gone.md", "gone2.md", "gone3.md"])
+        self.assertEqual([x["line"] for x in r.get("mixed_index_lines", [])], [1, 2])
+        self.assertEqual([x["line"] for x in r.get("index_lines_to_drop", [])], [3])
+        self.assertEqual(r["broken_index_links"], ["gone.md", "gone2.md", "gone3.md", "gone4.md"])
+        before = self.read(os.path.join(mem, "MEMORY.md"))
         proc = self.run_script("memory_check.py", "--project=-tmp-demo")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Mixed index lines", proc.stdout)
-        self.assertIn("Index lines to drop, every link on them broken: line 2 (", proc.stdout)
+        self.assertIn("Index drop candidates, one plain link and it is broken (a proposal): line 3 (", proc.stdout)
+        self.assertIn("Index changes are proposals", proc.stdout)
+        self.assertEqual(self.read(os.path.join(mem, "MEMORY.md")), before)
+
+    # round 3, item 2
+    def test_literal_percent_file_name_is_not_broken(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a%20b.md"), "n\n")
+        self.write(os.path.join(mem, "MEMORY.md"), "- [N](a%20b.md): x\n")
+        r = memory_check.check(self.pdir, common.config())
+        self.assertEqual(r["broken_index_links"], [])
+        self.assertEqual(r["index_lines_to_drop"], [])
+        self.assertEqual(r["orphans"], [])
+
+    def test_broken_link_next_to_anything_else_is_mixed(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "ok.md"), "ok\n")
+        self.write(os.path.join(mem, "MEMORY.md"),
+                   "- [G](gone1.md): see https://example.com/page\n"
+                   "- [G](gone2.md): see [[ok]]\n"
+                   "- **Rule for deploys.** Details: [r](gone3.md)\n"
+                   "- [C](gone4.md): run `make`\n"
+                   "- [P](gone5.md): a plain hook\n")
+        r = memory_check.check(self.pdir, common.config())
+        self.assertEqual([x["line"] for x in r["mixed_index_lines"]], [1, 2, 3, 4])
+        self.assertEqual([x["line"] for x in r["index_lines_to_drop"]], [5])
+
+    # round 3, item 1 and item 4
+    def test_docs_run_no_git_and_scope_read(self):
+        root = os.path.dirname(HERE)
+        git_cmd = re.compile(r"\bgit\s+(?:-C|-c|--no-pager|--git-dir|log|status|show|rev-parse|branch|diff|config|"
+                             r"fetch|remote|describe|ls-files|cat-file|for-each-ref)\b")
+        for doc in ("SKILL.md", "SECURITY.md", "README.md", os.path.join("references", "verify-agent.md")):
+            self.assertIsNone(git_cmd.search(self.read(os.path.join(root, doc))), doc)
+        self.assertIn(".git/HEAD", self.read(os.path.join(root, "references", "verify-agent.md")))
+        skill = self.read(os.path.join(root, "SKILL.md"))
+        self.assertNotIn("'Read'", skill)
+        for rule in ("'Read(~/.claude/projects/<key>/**)'", "'Read(~/.claude/token-checkup/**)'",
+                     "'Read(<skill dir>/**)'"):
+            self.assertIn(rule, skill)
+
+    # round 3, item 5
+    def test_dotdot_and_network_paths_are_not_checked(self):
+        mem = self.mem()
+        risky = ["/mnt/share/x.txt", "/Users/../net/host/x", "~/../../Volumes/disk/x", "/tmp/a/../b",
+                 "/private/../Network/Servers/x"]
+        self.write(os.path.join(mem, "n.md"),
+                   "---\ntype: project\n---\n" + " ".join(f"`{p}`" for p in risky) + "\n")
+        seen, real = [], os.path.exists
+
+        def spy(p):
+            seen.append(os.fspath(p))
+            return real(p)
+
+        with mock.patch("os.path.exists", side_effect=spy):
+            row = self.rows()["n.md"]
+        self.assertEqual(row["dead_paths"], [])
+        self.assertEqual(row["unusual_paths"], risky)
+        self.assertFalse({os.path.expanduser(p) for p in risky} & set(seen))
 
     def test_link_regex_is_linear(self):
         mem = self.mem()
@@ -581,6 +698,10 @@ class MemoryTests(Base):
         self.assertEqual(r["broken_index_links"], [])
         self.assertEqual(memory_check.LINK.findall("- [A](a.md) [B](sub/my%20note.md)"), ["a.md", "sub/my%20note.md"])
         self.assertEqual(memory_check.LINK.findall("](" + "a" * 201 + ".md)"), [])
+        start = time.monotonic()
+        for tail in ("c" * 40_000, ".md)" * 10_000):
+            self.assertIsNone(memory_check.PLAIN_LINE.fullmatch("- [" + "a" * 300 + "](" + "b" * 200 + tail))
+        self.assertLess(time.monotonic() - start, 0.5)
 
 
 class SetupTests(Base):
