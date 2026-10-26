@@ -2,15 +2,19 @@
 
 Run: python3 -m unittest discover -s tests
 """
+import datetime as dt
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
@@ -21,6 +25,9 @@ import context_guard  # noqa: E402
 import measure  # noqa: E402
 import memory_check  # noqa: E402
 import setup as tc_setup  # noqa: E402
+
+STAMPED_SETTINGS = re.compile(r"settings-\d{8}-\d{6}-\d{6}(?:-\d+)?\.json")
+STAMPED_MEMORY = re.compile(r"memory-\d{8}-\d{6}-\d{6}(?:-\d+)?")
 
 
 def assistant(mid, ctx, tool=None):
@@ -38,25 +45,43 @@ def tool_result(mid, text):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
         os.environ["CLAUDE_CONFIG_DIR"] = self.tmp
         self.pdir = os.path.join(self.tmp, "projects", "-tmp-demo")
         os.makedirs(self.pdir)
 
     def tearDown(self):
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        for root, dirs, _ in os.walk(self.tmp):
+            for d in dirs:
+                p = os.path.join(root, d)
+                if not os.path.islink(p):
+                    os.chmod(p, 0o700)
         shutil.rmtree(self.tmp)
 
     def write(self, path, text):
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(text)
+
+    def read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
 
     def transcript(self, name, entries):
         path = os.path.join(self.pdir, name + ".jsonl")
         with open(path, "w") as f:
             for e in entries:
-                f.write(json.dumps(e) + "\n")
+                f.write((e if isinstance(e, str) else json.dumps(e)) + "\n")
         return path
+
+    def mem(self):
+        mem = os.path.join(self.pdir, "memory")
+        os.makedirs(mem, exist_ok=True)
+        return mem
+
+    def run_script(self, name, *args, cwd=None):
+        return subprocess.run([sys.executable, os.path.join(SCRIPTS, name)] + list(args),
+                              capture_output=True, text=True, cwd=cwd or self.tmp)
 
 
 class TranscriptTests(Base):
@@ -89,6 +114,196 @@ class TranscriptTests(Base):
         self.assertEqual(m["over_400k"], 1)
         self.assertEqual(m["over_window"], 1)
         self.assertEqual(m["first_by_version"]["9.9.9"][0], 80_000)
+
+    # item 2
+    def test_transcripts_skip_symlinks_and_dirs(self):
+        real = self.transcript("real", [assistant("a", 1000)])
+        outside = os.path.join(self.tmp, "outside.jsonl")
+        self.write(outside, json.dumps(assistant("b", 2000)) + "\n")
+        os.symlink(outside, os.path.join(self.pdir, "link.jsonl"))
+        os.makedirs(os.path.join(self.pdir, "dir.jsonl"))
+        self.assertEqual(common.transcripts(self.pdir), [real])
+
+    # item 3
+    def test_parsing_survives_odd_records(self):
+        path = self.transcript("odd", [
+            "[]", '"text"', "42", "null", "not json",
+            {"type": "assistant", "message": "nope"},
+            {"type": "assistant", "message": {"id": ["x"], "usage": {"input_tokens": "100"}}},
+            {"type": "assistant", "message": {"id": "u", "usage": "bad"}},
+            {"type": ["assistant"], "version": 5},
+            {"type": "attachment", "attachment": ["x"]},
+            {"type": "assistant", "message": {"id": "t", "content": [
+                {"type": "tool_use", "id": ["a"], "name": 5}, {"type": "tool_use", "id": "ok", "name": ["n"]}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": {"a": 1}, "content": [{"type": "text", "text": 7}]}]}},
+            '{"type": "assistant", "message": {"id": "n", "usage": {"input_tokens": NaN, '
+            '"cache_read_input_tokens": Infinity, "cache_creation_input_tokens": -5, "output_tokens": true}}}',
+            {"type": "assistant", "message": {"id": "f", "usage": {
+                "input_tokens": 2500.0, "cache_read_input_tokens": True, "cache_creation_input_tokens": None}}},
+            assistant("m1", 100_000),
+        ])
+        r = common.session_stats(path)
+        self.assertEqual(r["series"], [2500, 100_000])
+        self.assertEqual(r["version"], "9.9.9")
+        self.assertEqual(r["cache_read"], 99_990)
+
+    def test_last_context_survives_odd_records(self):
+        path = self.transcript("odd2", [
+            assistant("m1", 100_000), '["usage"]', '{"type": "assistant", "message": {"usage": ["x"]}}',
+            '{"type": "assistant", "message": "usage"}',
+            '{"type": "assistant", "message": {"usage": {"input_tokens": "9", "output_tokens": NaN}}}'])
+        self.assertEqual(common.last_context(path), 100_005)
+
+    # item 7
+    def test_mean_context_per_call_is_full_context(self):
+        first = {"type": "assistant", "message": {"id": "c1", "usage": {
+            "input_tokens": 1000, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 99_000,
+            "output_tokens": 1}}}
+        self.transcript("full", [first, assistant("c2", 200_000)])
+        m = measure.run(self.pdir, None, None, common.config())
+        self.assertEqual(m["context_per_call"], 150_000)
+        self.assertEqual(m["cache_read_total"], 199_990)
+
+    def test_baseline_only_for_medians_and_per_call(self):
+        self.transcript("b1", [assistant("a", 80_000), assistant("b", 450_000)])
+        m = measure.run(self.pdir, None, None, common.config())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            measure.report(m, "label", None, m, 300_000)
+        lines = {ln[2:50].rstrip(): ln for ln in out.getvalue().splitlines() if ln.startswith("  ")}
+        for name in ("first-call context (median)", "peak context (median)", "peak context (p90)",
+                     "mean context per model call", "cache reads per session (median)"):
+            self.assertIn("vs baseline", lines[name], name)
+        for name in ("sessions", "sessions over 400k", "compactions", "cache reads total", "images in tool results"):
+            self.assertNotIn("vs baseline", lines[name], name)
+
+    def test_missed_compaction_since_setup(self):
+        self.transcript("big", [assistant("a", 80_000), assistant("b", 450_000)])
+        self.transcript("small", [assistant("c", 80_000)])
+        os.makedirs(common.data_dir())
+        rec = os.path.join(common.data_dir(), "install.json")
+        for when, missed in (("2000-01-01T00:00:00+00:00", 1), ("2100-01-01T00:00:00+00:00", 0)):
+            self.write(rec, json.dumps({"previous_autoCompactWindow": "missing", "installed_value": 300_000,
+                                        "installed_at": when}))
+            m = measure.run(self.pdir, None, None, common.config())
+            self.assertEqual(m["missed_compaction"], missed)
+            self.assertEqual(m["over_window"], 1)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            measure.report(m, "label", None, None, 300_000)
+        self.assertIn("sessions that should have compacted but did not (since setup)", out.getvalue())
+        self.assertIn("sessions over the compact window x1.1 (any)", out.getvalue())
+
+
+class ProjectTests(Base):
+    # item 1
+    def test_project_path_maps_to_transcript_folder(self):
+        work = os.path.join(self.tmp, "work", "my proj")
+        os.makedirs(work)
+        pdir = os.path.join(self.tmp, "projects", common.project_key(work))
+        os.makedirs(pdir)
+        self.assertEqual(common.project_dir(work), pdir)
+        other = os.path.join(self.tmp, "work", "no transcripts")
+        os.makedirs(other)
+        with self.assertRaises(SystemExit):
+            common.project_dir(other)
+
+    def test_project_bare_key_and_outside_candidates(self):
+        self.assertEqual(common.project_dir("-tmp-demo"), self.pdir)
+        self.write(os.path.join(self.tmp, "projects", "-a-file"), "x")
+        for bad in ("..", ".", "../projects/-tmp-demo", "-a-file", "-not-there"):
+            with self.assertRaises(SystemExit, msg=bad):
+                common.project_dir(bad)
+
+    def test_no_project_and_unknown_cwd_is_a_clear_error(self):
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        proc = self.run_script("measure.py", cwd=elsewhere)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--project", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        old = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            pdir = os.path.join(self.tmp, "projects", common.project_key(os.getcwd()))
+            os.makedirs(pdir)
+            self.assertEqual(common.project_dir(), pdir)
+        finally:
+            os.chdir(old)
+
+    def test_scripts_print_project_key_first(self):
+        self.transcript("k", [assistant("a", 1000)])
+        self.mem()
+        for script in ("measure.py", "audit_start.py", "memory_check.py"):
+            proc = self.run_script(script, "--project=-tmp-demo")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], "project: -tmp-demo", script)
+            self.assertIn("--project=KEY", self.run_script(script, "--help").stdout, script)
+
+    # item 3
+    def test_config_ignores_bad_file_and_wrong_types(self):
+        os.makedirs(common.data_dir())
+        path = os.path.join(common.data_dir(), "config.json")
+        self.write(path, "[1, 2]")
+        self.assertEqual(common.config(), common.DEFAULTS)
+        self.write(path, json.dumps({"compact_window": "300000", "guard_bands": [250_000, "x"],
+                                     "auto_fix_memory": "yes", "reverify_days": True, "split_chars": 5000,
+                                     "index_line_max": 1.5}))
+        cfg = common.config()
+        self.assertEqual(cfg["split_chars"], 5000)
+        for key in ("compact_window", "guard_bands", "auto_fix_memory", "reverify_days", "index_line_max"):
+            self.assertEqual(cfg[key], common.DEFAULTS[key], key)
+
+    # item 10
+    def test_auto_fix_memory_defaults_off(self):
+        self.assertIs(common.DEFAULTS["auto_fix_memory"], False)
+        self.assertIs(common.config()["auto_fix_memory"], False)
+        os.makedirs(common.data_dir())
+        self.write(os.path.join(common.data_dir(), "config.json"), json.dumps({"auto_fix_memory": True}))
+        self.assertIs(common.config()["auto_fix_memory"], True)
+
+    def test_bad_dates_are_a_clear_error(self):
+        for args in (["--since", "2026-13-45"], ["--until", "yesterday"]):
+            proc = self.run_script("measure.py", "--project=-tmp-demo", *args)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertNotIn("Traceback", proc.stderr)
+            self.assertIn(args[0], proc.stderr)
+
+    # item 8
+    def test_audit_reads_project_folder_claude_md(self):
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(os.path.join(work, ".claude"))
+        self.write(os.path.join(work, "CLAUDE.md"), "w" * 1234)
+        self.write(os.path.join(work, ".claude", "CLAUDE.md"), "w" * 10)
+        self.write(os.path.join(work, "CLAUDE.local.md"), "w" * 7)
+        os.makedirs(os.path.join(self.tmp, "projects", common.project_key(work)))
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        self.write(os.path.join(elsewhere, "CLAUDE.md"), "e" * 99)
+        proc = self.run_script("audit_start.py", "--project", work, "--json", cwd=elsewhere)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["project_folder"], work)
+        self.assertEqual(r["files"]["<project>/CLAUDE.md"], 1234)
+        self.assertEqual(r["files"]["<project>/.claude/CLAUDE.md"], 10)
+        self.assertEqual(r["files"]["<project>/CLAUDE.local.md"], 7)
+
+    def test_audit_growth_shows_small_values(self):
+        now = time.time()
+        old = self.transcript("old", [{"type": "attachment", "attachment": {"type": "hook_additional_context",
+                                                                            "content": "x" * 10}},
+                                      assistant("a", 1000)])
+        os.utime(old, (now - 10 * 86400, now - 10 * 86400))
+        self.transcript("new", [{"type": "attachment", "attachment": {"type": "hook_additional_context",
+                                                                      "content": "x" * 410}},
+                                assistant("b", 1000)])
+        proc = self.run_script("audit_start.py", "--project=-tmp-demo", "--days", "7")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = [ln for ln in proc.stdout.splitlines() if "attachment:hook_additional_context" in ln][0]
+        self.assertNotIn("0k", line)
+        self.assertIn("+400 bytes", line)
+        self.assertIn("+100 tokens", line)
 
 
 class SimulateTests(Base):
@@ -130,11 +345,23 @@ class GuardTests(Base):
                               input="not json", capture_output=True, text=True)
         self.assertEqual((proc.returncode, proc.stdout), (0, ""))
 
+    # item 5
+    def test_old_guard_state_files_are_pruned(self):
+        gdir = os.path.join(common.data_dir(), "guard")
+        os.makedirs(gdir)
+        old, recent = os.path.join(gdir, "old-session.json"), os.path.join(gdir, "recent.json")
+        self.write(old, '{"band": 250000}')
+        self.write(recent, '{"band": 250000}')
+        t = time.time() - 40 * 86400
+        os.utime(old, (t, t))
+        self.assertIn("context-guard", self.run_hook(self.transcript("g3", [assistant("m1", 260_000)])))
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(recent))
+
 
 class MemoryTests(Base):
     def test_index_and_memory_checks(self):
-        mem = os.path.join(self.pdir, "memory")
-        os.makedirs(mem)
+        mem = self.mem()
         with open(os.path.join(mem, "MEMORY.md"), "w") as f:
             f.write("- [A](a.md): short\n- [Gone](gone.md): " + "x" * 200 + "\n")
         with open(os.path.join(mem, "a.md"), "w") as f:
@@ -155,34 +382,296 @@ class MemoryTests(Base):
         self.assertEqual(rows["b.md"]["dead_paths"], ["~/definitely/not/here.txt"])
 
     def test_used_memory_is_not_archive_candidate(self):
-        mem = os.path.join(self.pdir, "memory")
-        os.makedirs(mem)
+        mem = self.mem()
         self.write(os.path.join(mem, "MEMORY.md"), "- [P](p.md): x\n")
         self.write(os.path.join(mem, "p.md"), "---\nmetadata:\n  type: project\n---\nbody\n")
         self.transcript("u", [{"type": "user", "message": {"content": f"read {mem}/p.md"}}, assistant("m", 1000)])
         rows = {x["file"]: x for x in memory_check.check(self.pdir, common.config())["memories"]}
         self.assertFalse(rows["p.md"]["archive_candidate"])
 
+    def rows(self):
+        return {x["file"]: x for x in memory_check.check(self.pdir, common.config())["memories"]}
+
+    # item 2
+    def test_memory_files_skip_symlinks_and_dirs(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a.md"), "---\ntype: project\n---\nbody\n")
+        outside = os.path.join(self.tmp, "outside.md")
+        self.write(outside, "secret\n")
+        os.symlink(outside, os.path.join(mem, "link.md"))
+        os.makedirs(os.path.join(mem, "sub.md"))
+        self.assertEqual(list(self.rows()), ["a.md"])
+
+    # item 6
+    def test_verified_regex_is_linear(self):
+        text = ("Verified" + "*" * 3000) * 40
+        start = time.monotonic()
+        memory_check.VERIFIED.findall(text)
+        self.assertLess(time.monotonic() - start, 0.5)
+        for ok in ("**Verified 2026-10-20:** ok", "Verificato: 2026-10-20", "**Verificato** 2026-10-20",
+                   "**Verified:** 2026-10-20"):
+            self.assertEqual(memory_check.VERIFIED.findall(ok), ["2026-10-20"], ok)
+
+    def test_verified_dates_invalid_and_future_ignored(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "bad.md"), "**Verified 2026-13-45:** x\n")
+        self.write(os.path.join(mem, "future.md"), "**Verified 2999-01-01:** x\n")
+        self.write(os.path.join(mem, "mixed.md"),
+                   "Verified 2026-10-01\n**Verificato:** 2026-10-20 ok\nVerified 2999-12-31\n")
+        rows = self.rows()
+        self.assertIsNone(rows["bad.md"]["verified"])
+        self.assertIn("never verified", rows["bad.md"]["needs_check"])
+        self.assertIsNone(rows["future.md"]["verified"])
+        self.assertEqual(rows["mixed.md"]["verified"], "2026-10-20")
+
+    def test_needs_user_is_waiting_not_verified(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "w.md"), "---\ntype: project\n---\nbody\n**Verified 2026-10-20:** ok\n"
+                                              "**Needs user 2026-10-21:** is the deploy done?\n")
+        row = self.rows()["w.md"]
+        self.assertIsNone(row["verified"])
+        self.assertIn("waiting for the user", row["needs_check"])
+
+    def test_quoted_frontmatter_type(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "q.md"), '---\nname: q\ntype: "feedback"\n---\nrule\n')
+        self.write(os.path.join(mem, "q2.md"), "---\nmetadata:\n  type: 'user'\n---\nnote\n")
+        rows = self.rows()
+        self.assertEqual((rows["q.md"]["type"], rows["q2.md"]["type"]), ("feedback", "user"))
+        self.assertFalse(rows["q.md"]["archive_candidate"])
+
+    def test_wiki_and_path_patterns(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "p.md"),
+                   "---\ntype: project\n---\n[[multi\nline]] [[" + "w" * 250 + "]]\n"
+                   "`~/a\nb` `/var/definitely-missing-xyz` `/tmp/$(touch pwned)` `/srv/a;b` `/tmp/"
+                   + "p" * 400 + "`\n")
+        row = self.rows()["p.md"]
+        self.assertEqual(row["dead_links"], [])
+        self.assertEqual(row["dead_paths"], ["/var/definitely-missing-xyz"])
+        self.assertEqual(row["unusual_paths"], ["/tmp/$(touch pwned)", "/srv/a;b"])
+
+    def test_printed_memory_text_is_sanitized(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "MEMORY.md"), "- [E](e.md): x\n")
+        self.write(os.path.join(mem, "e.md"), "---\ntype: project\n---\n[[evil\x1b[2Jname]] [[" + "z" * 190 + "]]\n")
+        proc = self.run_script("memory_check.py", "--project=-tmp-demo")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("evil", proc.stdout)
+        self.assertNotIn("\x1b", proc.stdout)
+        self.assertNotIn("z" * 121, proc.stdout)
+
+    def test_index_links_resolved_inside_memory_folder(self):
+        mem = self.mem()
+        os.makedirs(os.path.join(mem, "sub"))
+        self.write(os.path.join(mem, "MEMORY.md"), "- [A](./a.md): x\n- [S](sub/s.md): x\n- [O](../outside.md): x\n"
+                                                   "- [G](gone.md): x\n- [N](sub/../a.md): x\n")
+        self.write(os.path.join(mem, "a.md"), "a\n")
+        self.write(os.path.join(mem, "sub", "s.md"), "s\n")
+        self.write(os.path.join(self.pdir, "outside.md"), "o\n")
+        r = memory_check.check(self.pdir, common.config())
+        self.assertEqual(r["broken_index_links"], ["gone.md"])
+        self.assertEqual(r["orphans"], [])
+        self.assertEqual(r["outside_index_links"], ["../outside.md"])
+
+    def test_backup_copies_only_regular_md(self):
+        mem = self.mem()
+        os.makedirs(os.path.join(mem, "sub"))
+        self.write(os.path.join(mem, "a.md"), "a\n")
+        self.write(os.path.join(mem, "sub", "b.md"), "b\n")
+        self.write(os.path.join(mem, "notes.txt"), "n\n")
+        secret = os.path.join(self.tmp, "secret.md")
+        self.write(secret, "secret\n")
+        os.symlink(secret, os.path.join(mem, "link.md"))
+        outdir = os.path.join(self.tmp, "outdir")
+        os.makedirs(outdir)
+        self.write(os.path.join(outdir, "c.md"), "c\n")
+        os.symlink(outdir, os.path.join(mem, "linkdir"))
+        res = memory_check.backup(mem)
+        got = sorted(os.path.relpath(os.path.join(r, f), res["path"])
+                     for r, _, fs in os.walk(res["path"]) for f in fs)
+        self.assertEqual(got, ["a.md", os.path.join("sub", "b.md")])
+        self.assertEqual((res["files"], res["errors"]), (2, []))
+        if os.geteuid() != 0:
+            locked = os.path.join(mem, "locked.md")
+            self.write(locked, "l\n")
+            os.chmod(locked, 0)
+            try:
+                res = memory_check.backup(mem)
+            finally:
+                os.chmod(locked, 0o600)
+            self.assertEqual(len(res["errors"]), 1)
+            self.assertEqual(res["files"], 2)
+
+    def test_backup_unique_names_and_safe_rotation(self):
+        mem = self.mem()
+        self.write(os.path.join(mem, "a.md"), "a\n")
+        root = os.path.join(common.data_dir(), "backups")
+        os.makedirs(os.path.join(root, "memory-keepme"))
+        os.makedirs(os.path.join(root, "memory-20200101-000000"))
+        paths = [memory_check.backup(mem)["path"] for _ in range(6)]
+        self.assertEqual(len(set(paths)), 6)
+        names = sorted(os.listdir(root))
+        stamped = [n for n in names if STAMPED_MEMORY.fullmatch(n)]
+        self.assertEqual(stamped, [os.path.basename(p) for p in paths[-4:]])
+        self.assertIn("memory-keepme", names)
+        self.assertIn("memory-20200101-000000", names)
+
 
 class SetupTests(Base):
+    def settings(self):
+        return os.path.join(self.tmp, "settings.json")
+
+    def save_settings(self, s):
+        self.write(self.settings(), json.dumps(s))
+
+    def read_settings(self):
+        return json.loads(self.read(self.settings()))
+
+    def call(self, fn, *args, **kw):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            fn(*args, **kw)
+        return out.getvalue()
+
+    def commands(self):
+        return [h["command"] for g in self.read_settings()["hooks"]["UserPromptSubmit"] for h in g["hooks"]]
+
     def test_install_and_uninstall_roundtrip(self):
         other = {"type": "command", "command": "echo other"}
         old_guard = {"type": "command", "command": "python3 /old/context_guard.py hook"}
-        with open(os.path.join(self.tmp, "settings.json"), "w") as f:
-            json.dump({"hooks": {"UserPromptSubmit": [{"hooks": [other, old_guard]}]}}, f)
-        with redirect_stdout(io.StringIO()):
-            tc_setup.install(300_000, True)
-        s = common.read_json(os.path.join(self.tmp, "settings.json"))
-        cmds = [h["command"] for h in s["hooks"]["UserPromptSubmit"][0]["hooks"]]
+        self.save_settings({"hooks": {"UserPromptSubmit": [{"hooks": [other, old_guard]}]}})
+        self.call(tc_setup.install, 300_000, True, replace_legacy=True)
+        s = self.read_settings()
+        cmds = self.commands()
         self.assertEqual(s["autoCompactWindow"], 300_000)
         self.assertEqual(len([c for c in cmds if "context_guard.py" in c]), 1)
         self.assertTrue(any(tc_setup.TAG in c for c in cmds))
         self.assertIn("echo other", cmds)
-        with redirect_stdout(io.StringIO()):
-            tc_setup.uninstall()
-        s = common.read_json(os.path.join(self.tmp, "settings.json"))
+        self.call(tc_setup.uninstall)
+        s = self.read_settings()
         self.assertNotIn("autoCompactWindow", s)
-        self.assertEqual([h["command"] for h in s["hooks"]["UserPromptSubmit"][0]["hooks"]], ["echo other"])
+        self.assertEqual(s["hooks"]["UserPromptSubmit"], [{"hooks": [other]}])
+
+    # item 4
+    def test_untagged_guard_left_alone_unless_replace_legacy(self):
+        legacy = {"type": "command", "command": "python3 /old/context_guard.py hook"}
+        self.save_settings({"hooks": {"UserPromptSubmit": [{"hooks": [legacy]}]}})
+        out = self.call(tc_setup.install, 300_000, True)
+        cmds = self.commands()
+        self.assertIn(legacy["command"], cmds)
+        self.assertEqual(sum(tc_setup.TAG in c for c in cmds), 1)
+        self.assertIn("left untouched", out)
+        self.call(tc_setup.install, 300_000, True, replace_legacy=True)
+        cmds = self.commands()
+        self.assertNotIn(legacy["command"], cmds)
+        self.assertEqual(sum(tc_setup.TAG in c for c in cmds), 1)
+
+    def test_other_groups_untouched_and_no_empty_hooks_left(self):
+        original = {"theme": "dark", "hooks": {
+            "UserPromptSubmit": [{"hooks": []}, {"matcher": "", "hooks": [{"type": "command", "command": "echo o"}]}],
+            "Stop": []}}
+        for start in (original, {"theme": "dark"}):
+            self.save_settings(start)
+            self.call(tc_setup.install, 300_000, True)
+            self.call(tc_setup.uninstall)
+            self.assertEqual(self.read_settings(), start)
+
+    def test_save_follows_symlink_keeps_mode_and_unicode(self):
+        real_dir = os.path.join(self.tmp, "dotfiles")
+        os.makedirs(real_dir)
+        target = os.path.join(real_dir, "settings.json")
+        self.write(target, json.dumps({"name": "citt\u00e0"}))
+        os.chmod(target, 0o640)
+        os.symlink(target, self.settings())
+        self.call(tc_setup.install, 300_000, True)
+        self.assertTrue(os.path.islink(self.settings()))
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o640)
+        text = self.read(target)
+        self.assertIn("citt\u00e0", text)
+        self.assertIn("autoCompactWindow", text)
+        self.assertEqual(os.listdir(real_dir), ["settings.json"])
+        os.remove(self.settings())
+        self.call(tc_setup.install, 300_000, True)
+        self.assertEqual(os.stat(self.settings()).st_mode & 0o777, 0o600)
+
+    def test_bad_settings_exit_without_writing(self):
+        cases = ["{not json", "[1, 2]", json.dumps({"hooks": []}),
+                 json.dumps({"hooks": {"UserPromptSubmit": {"a": 1}}}),
+                 json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": "x"}]}}),
+                 json.dumps({"hooks": {"UserPromptSubmit": ["x"]}}), '{"a": NaN}']
+        for text in cases:
+            for fn, args in ((tc_setup.install, (300_000, True)), (tc_setup.uninstall, ())):
+                self.write(self.settings(), text)
+                with self.assertRaises(SystemExit, msg=text) as cm:
+                    self.call(fn, *args)
+                self.assertIsInstance(cm.exception.code, str)
+                self.assertEqual(self.read(self.settings()), text)
+                self.assertFalse(os.path.exists(os.path.join(common.data_dir(), "backups")))
+                self.assertFalse(os.path.exists(os.path.join(common.data_dir(), "install.json")))
+
+    def test_settings_backups_unique_first_kept_last_five(self):
+        self.save_settings({"v": 0})
+        for i in range(8):
+            self.call(tc_setup.install, 300_000 + i * 1000, True)
+        bdir = os.path.join(common.data_dir(), "backups")
+        names = sorted(os.listdir(bdir))
+        self.assertIn("settings-first.json", names)
+        self.assertEqual(len([n for n in names if STAMPED_SETTINGS.fullmatch(n)]), 5)
+        self.assertEqual(json.loads(self.read(os.path.join(bdir, "settings-first.json"))), {"v": 0})
+        for n in names:
+            self.assertEqual(os.stat(os.path.join(bdir, n)).st_mode & 0o777, 0o600, n)
+
+    def test_install_record_and_uninstall_restore_rules(self):
+        rec_path = os.path.join(common.data_dir(), "install.json")
+        self.save_settings({"autoCompactWindow": 500_000})
+        self.call(tc_setup.install, 300_000, True)
+        rec = common.read_json(rec_path)
+        self.assertEqual((rec["previous_autoCompactWindow"], rec["installed_value"]), (500_000, 300_000))
+        dt.datetime.fromisoformat(rec["installed_at"])
+        self.call(tc_setup.install, 400_000, True)
+        rec = common.read_json(rec_path)
+        self.assertEqual((rec["previous_autoCompactWindow"], rec["installed_value"]), (500_000, 400_000))
+        self.call(tc_setup.uninstall)
+        self.assertEqual(self.read_settings()["autoCompactWindow"], 500_000)
+        # the user changed the value after install: left as it is
+        self.save_settings({})
+        self.call(tc_setup.install, 300_000, True)
+        s = self.read_settings()
+        s["autoCompactWindow"] = 450_000
+        self.save_settings(s)
+        out = self.call(tc_setup.uninstall)
+        self.assertEqual(self.read_settings()["autoCompactWindow"], 450_000)
+        self.assertIn("left", out)
+        # an unusable previous value: left as it is
+        self.save_settings({"autoCompactWindow": 50})
+        self.call(tc_setup.install, 300_000, True)
+        out = self.call(tc_setup.uninstall)
+        self.assertEqual(self.read_settings()["autoCompactWindow"], 300_000)
+        self.assertIn("left", out)
+
+    def test_uninstall_with_nothing_installed_writes_nothing(self):
+        self.assertIn("nothing to remove", self.call(tc_setup.uninstall))
+        self.assertFalse(os.path.exists(self.settings()))
+        self.save_settings({"theme": "dark"})
+        before = os.stat(self.settings()).st_mtime_ns
+        self.assertIn("nothing to remove", self.call(tc_setup.uninstall))
+        self.assertEqual(os.stat(self.settings()).st_mtime_ns, before)
+        self.assertFalse(os.path.exists(os.path.join(common.data_dir(), "backups")))
+
+    def test_venv_warning(self):
+        with mock.patch.object(sys, "prefix", "/fake/venv"):
+            out = self.call(tc_setup.install, 300_000, True)
+        self.assertIn("virtualenv", out)
+
+    def test_check_reports_broken_hook_paths(self):
+        self.call(tc_setup.install, 300_000, True)
+        self.assertRegex(self.call(tc_setup.check), r"hook command: OK")
+        s = self.read_settings()
+        s["hooks"]["UserPromptSubmit"][-1]["hooks"][0]["command"] = (
+            "'/nonexistent/python3' '/nonexistent/context_guard.py' hook 2>/dev/null || true " + tc_setup.TAG)
+        self.save_settings(s)
+        self.assertRegex(self.call(tc_setup.check), r"hook command: BROKEN")
 
 
 if __name__ == "__main__":

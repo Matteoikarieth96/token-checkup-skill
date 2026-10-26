@@ -6,7 +6,9 @@ from the transcript and, the first time a session crosses each band
 (config "guard_bands", default 250k/400k/550k/700k/850k), asks Claude to open
 its reply with one line suggesting a new session or /compact.
 
-It never blocks a prompt: any error means no output and exit 0.
+It never blocks a prompt: any error means no output and exit 0. State files
+(one per session, under <data dir>/guard/) older than 30 days are deleted
+whenever it saves state.
 
 Usage:
   context_guard.py hook            # hook mode, reads the hook JSON on stdin
@@ -14,9 +16,13 @@ Usage:
 """
 import json
 import os
+import stat
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+STATE_MAX_AGE_DAYS = 30  # state files of sessions idle longer than this are deleted
 
 
 def band_of(tokens, bands):
@@ -32,9 +38,28 @@ def state_file(session):
 def load_band(session):
     try:
         with open(state_file(session)) as f:
-            return json.load(f).get("band", 0)
-    except (OSError, ValueError):
+            band = json.load(f).get("band", 0)
+    except (OSError, ValueError, AttributeError):
         return 0
+    return band if isinstance(band, int) and not isinstance(band, bool) else 0
+
+
+def prune_state(folder, keep, max_age_days=STATE_MAX_AGE_DAYS):
+    """Delete guard state files older than max_age_days. Best effort: never raises."""
+    try:
+        cutoff = time.time() - max_age_days * 86400
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if not name.endswith(".json") or path == keep:
+                continue
+            try:
+                st = os.lstat(path)
+                if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                    os.remove(path)
+            except OSError:
+                continue
+    except Exception:
+        pass
 
 
 def save_band(session, band):
@@ -42,6 +67,7 @@ def save_band(session, band):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump({"band": band}, f)
+    prune_state(os.path.dirname(path), path)
 
 
 def message(tokens):
