@@ -19,6 +19,7 @@ transcript folder under ~/.claude/projects/ written as --project=KEY.
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import sys
 
@@ -29,10 +30,25 @@ from common import (PROJECT_HELP, config, data_dir, install_record, k, median, p
 HISTORY = "history.jsonl"
 HISTORY_VERSION = 2  # 2: context_per_call is the full context (input + cache read + cache creation) per call
 # Windows can differ in length, so only medians and per-call values are compared with the baseline.
-BASELINE_KEYS = {"first_median", "peak_median", "peak_p90", "context_per_call", "cache_read_session_median"}
+# Per-day values are comparable too: they are divided by the length of their own window.
+BASELINE_KEYS = {"first_median", "peak_median", "peak_p90", "context_per_call", "cache_read_session_median",
+                 "calls_per_day", "cache_read_per_day"}
 
 
-def summarize(rows, cfg, rec=None):
+def per_day(m, days):
+    """Add the per-day values of a window that is `days` long (kept if already there)."""
+    if is_num(days) and days > 0:
+        m.setdefault("days", days)
+        for key, total in (("calls_per_day", "calls"), ("cache_read_per_day", "cache_read_total")):
+            if key not in m and is_num(m.get(total)):
+                try:
+                    m[key] = m[total] / days
+                except OverflowError:  # an absurd number in a saved run
+                    pass
+    return m
+
+
+def summarize(rows, cfg, rec=None, days=None):
     if not rows:
         return {"sessions": 0}
     window = cfg["compact_window"]
@@ -50,7 +66,7 @@ def summarize(rows, cfg, rec=None):
             tools[n] = tools.get(n, 0) + t
     comp = [c for r in rows for c in r["compactions"]]
     context_total = sum(sum(r["series"]) for r in rows)
-    return {
+    return per_day({
         "sessions": len(rows),
         "first_median": median([r["first"] for r in rows]),
         "first_by_version": {v: [median(x), len(x)] for v, x in sorted(by_version.items())},
@@ -65,6 +81,7 @@ def summarize(rows, cfg, rec=None):
                                  and r["peak"] > window * 1.1 and not r["compactions"]),
         "missed_since": rec.get("installed_at") if since is not None else None,
         "compactions": len(comp),
+        "sessions_compacted": sum(1 for r in rows if r["compactions"]),
         "compaction_at_median": median([b for b, _ in comp]),
         "after_compaction_median": median([a for _, a in comp]),
         "cache_read_total": sum(cr),
@@ -75,7 +92,7 @@ def summarize(rows, cfg, rec=None):
         "output_total": sum(r["out"] for r in rows),
         "images": sum(r["images"] for r in rows),
         "top_tools": sorted(tools.items(), key=lambda kv: -kv[1])[:8],
-    }
+    }, days)
 
 
 def simulate(rows, window, restart=None):
@@ -118,8 +135,8 @@ def load_rows(pdir, lo, hi, cfg):
     return [r for r in (session_stats(f, cfg["image_tokens"]) for f in files) if r]
 
 
-def run(pdir, lo, hi, cfg):
-    return summarize(load_rows(pdir, lo, hi, cfg), cfg)
+def run(pdir, lo, hi, cfg, days=None):
+    return summarize(load_rows(pdir, lo, hi, cfg), cfg, days=days)
 
 
 def is_num(v):
@@ -129,7 +146,9 @@ def is_num(v):
 def delta(now, before):
     if not is_num(before) or not before or not is_num(now):
         return ""
-    return f"  ({k(before) if before >= 1000 else before} -> {k(now) if now >= 1000 else now}, {100 * (now - before) / before:+.0f}%)"
+    def short(v):
+        return k(v) if v >= 1000 else (v if isinstance(v, int) else f"{v:.0f}")
+    return f"  ({short(before)} -> {short(now)}, {100 * (now - before) / before:+.0f}%)"
 
 
 def report(m, label, prev=None, base=None, window=None):
@@ -149,17 +168,22 @@ def report(m, label, prev=None, base=None, window=None):
         ("sessions over the compact window x1.1 (any)", "over_window", False),
         (missed, "missed_compaction", False),
         ("compactions", "compactions", False),
+        ("sessions that compacted at least once", "sessions_compacted", False),
         ("mean context per model call", "context_per_call", True),
+        ("model calls per day", "calls_per_day", False),
+        ("cache reads per day", "cache_read_per_day", True),
         ("cache reads per session (median)", "cache_read_session_median", True),
         ("cache reads total", "cache_read_total", True),
         ("images in tool results", "images", False),
     ]
     print(label)
     for name, key, tok in lines:
-        val = m[key]
-        shown = k(val) if tok else val
+        val = m.get(key)
+        if not is_num(val):  # per-day values need the window length; older saved runs lack newer keys
+            continue
+        shown = k(val) if tok else (val if isinstance(val, int) else f"{val:.0f}")
         extra = delta(val, p.get(key)) if p else ""
-        if b and key in BASELINE_KEYS:
+        if b and key in BASELINE_KEYS and delta(val, b.get(key)):
             extra += "  vs baseline" + delta(val, b.get(key))
         print(f"  {name:48s} {shown}{extra}")
     if window:
@@ -183,24 +207,69 @@ def parse_day(p, flag, s):
         p.error(f"{flag} must be a date written YYYY-MM-DD, got {s!r}")
 
 
+def history_lines():
+    try:
+        with open(os.path.join(data_dir(), HISTORY), errors="replace") as f:
+            return f.readlines()
+    except OSError:
+        return []
+
+
+def saved_run(line, key):
+    """The saved run on one history line if it belongs to this project, else None."""
+    try:
+        h = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    if isinstance(h, dict) and h.get("project") == key and isinstance(h.get("metrics"), dict):
+        return h
+    return None
+
+
+def window_days(h):
+    try:
+        return (dt.date.fromisoformat(h["until"]) - dt.date.fromisoformat(h["since"])).days + 1
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def saved_metrics(h):
+    """Metrics of a saved run, without numbers no real run can produce (they would break the report)."""
+    m = {name: v for name, v in h["metrics"].items()
+         if not is_num(v) or (isinstance(v, int) or math.isfinite(v)) and abs(v) <= 10 ** 18}
+    if h.get("v") != HISTORY_VERSION:  # older runs measured context_per_call differently
+        m.pop("context_per_call", None)
+    return per_day(m, window_days(h))
+
+
 def baseline(key):
     """Metrics of the first saved run for this project, or None."""
-    try:
-        with open(os.path.join(data_dir(), HISTORY)) as f:
-            lines = f.readlines()
-    except OSError:
-        return None
-    for line in lines:
-        try:
-            h = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(h, dict) and h.get("project") == key and isinstance(h.get("metrics"), dict):
-            base = dict(h["metrics"])
-            if h.get("v") != HISTORY_VERSION:  # older runs measured context_per_call differently
-                base.pop("context_per_call", None)
-            return base
+    for line in history_lines():
+        h = saved_run(line, key)
+        if h:
+            return saved_metrics(h)
     return None
+
+
+def saved_window(key, since, until):
+    """(metrics, date) of the newest saved run of exactly this window, or None.
+
+    A past window recomputed later is not the same measurement: sessions that went
+    on after it now count in a later window, and old transcripts may be gone.
+    """
+    for line in reversed(history_lines()):
+        h = saved_run(line, key)
+        if h and h.get("since") == str(since) and h.get("until") == str(until) and h["metrics"].get("sessions"):
+            return saved_metrics(h), h.get("date")
+    return None
+
+
+def save_run(entry):
+    """Append the run to the history file. Nothing saved before is rewritten: a second run of the
+    same window adds a line, and saved_window() reads the newest one."""
+    os.makedirs(data_dir(), exist_ok=True)
+    with open(os.path.join(data_dir(), HISTORY), "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 def main():
@@ -230,24 +299,29 @@ def main():
     span = (until - since).days + 1
     lo, hi = day_ts(str(since)), day_ts(str(until + dt.timedelta(days=1)))
     rows = load_rows(pdir, lo, hi, cfg)
-    now = summarize(rows, cfg)
+    now = summarize(rows, cfg, days=span)
     sim = simulate(rows, a.simulate) if a.simulate else None
-    prev = base = None
+    prev = base = prev_source = None
     if a.compare:
-        prev = run(pdir, lo - span * 86400, lo, cfg)
+        before = since - dt.timedelta(days=span)
+        saved = saved_window(key, before, since - dt.timedelta(days=1))
+        if saved:
+            prev, prev_source = saved[0], f"run saved on {saved[1]}"
+        else:
+            prev = run(pdir, day_ts(str(before)), lo, cfg, days=span)
+            prev_source = "recomputed today, no saved run of that window"
         base = baseline(key)
     if a.save:
-        os.makedirs(data_dir(), exist_ok=True)
-        with open(os.path.join(data_dir(), HISTORY), "a") as f:
-            f.write(json.dumps({"v": HISTORY_VERSION, "date": str(today), "since": str(since), "until": str(until),
-                                "project": key, "metrics": now}) + "\n")
+        save_run({"v": HISTORY_VERSION, "date": str(today), "since": str(since), "until": str(until),
+                  "project": key, "metrics": now})
     if a.json:
-        print(json.dumps({"project": key, "since": str(since), "until": str(until),
-                          "now": now, "previous": prev, "baseline": base, "simulation": sim}, indent=1))
+        print(json.dumps({"project": key, "since": str(since), "until": str(until), "now": now, "previous": prev,
+                          "previous_source": prev_source, "baseline": base, "simulation": sim}, indent=1))
         return
     report(now, f"{since} .. {until}  ({key}, subagents excluded)", prev, base, cfg["compact_window"])
     if a.compare and ((prev and prev.get("sessions")) or base):
-        print(f"(deltas: the {span} days before; 'vs baseline': first saved run, medians and per-call values only)")
+        print(f"(deltas: the {span} days before, {prev_source}; 'vs baseline': first saved run, "
+              "medians, per-call and per-day values only)")
     if sim:
         print(f"simulated compaction at {k(sim['window'])} (restart at about {k(sim['restart'])}): "
               f"{sim['sessions_affected']} of {sim['sessions']} sessions would compact; context re-read "

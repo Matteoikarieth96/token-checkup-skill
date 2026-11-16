@@ -1031,5 +1031,193 @@ class SetupTests(Base):
         self.assertRegex(self.call(tc_setup.check), r"hook command: BROKEN")
 
 
+def stamp(days_ago):
+    """ISO time, written the way transcripts write it, `days_ago` days before now."""
+    t = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days_ago)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + "000Z"
+
+
+def at(entry, days_ago):
+    return dict(entry, timestamp=stamp(days_ago))
+
+
+class ActivityWindowTests(Base):
+    """Sessions belong to a window by the time their transcript records, not by the file date."""
+
+    def touch(self, path, days_ago):
+        t = time.time() - days_ago * 86400
+        os.utime(path, (t, t))
+
+    def test_parse_iso_reads_the_z_suffix(self):
+        self.assertEqual(common.parse_iso("2026-01-02T03:04:05.000Z"),
+                         common.parse_iso("2026-01-02T03:04:05.000+00:00"))
+        self.assertIsNone(common.parse_iso("Z"))
+        self.assertIsNone(common.parse_iso(None))
+
+    def test_window_uses_recorded_time_not_file_date(self):
+        now = time.time()
+        old = self.transcript("old", [at(assistant("a", 1000), 40)])      # ended 40 days ago, file touched today
+        recent = self.transcript("recent", [at(assistant("b", 1000), 2)])  # ended 2 days ago, file dated 30 days back
+        self.touch(recent, 30)
+        self.assertEqual(common.transcripts(self.pdir, now - 7 * 86400, now), [recent])
+        self.assertEqual(common.transcripts(self.pdir, now - 45 * 86400, now - 7 * 86400), [old])
+        self.assertAlmostEqual(common.last_activity(old), now - 40 * 86400, delta=5)
+
+    def test_records_without_time_after_the_last_answer(self):
+        tail = [{"type": "cost-state", "pad": "x" * 300}] * 40  # what the app appends later, with no timestamp
+        path = self.transcript("t", [at(assistant("a", 1000), 20), at(assistant("b", 2000), 10)] + tail)
+        self.touch(path, 0)
+        want = time.time() - 10 * 86400
+        self.assertAlmostEqual(common.last_activity(path), want, delta=5)
+        self.assertAlmostEqual(common.last_activity(path, tails=(512,)), want, delta=5)       # falls back to the whole file
+        self.assertAlmostEqual(common.last_activity(path, tails=(512, 100_000)), want, delta=5)  # second, larger tail
+
+    def test_nested_timestamp_is_not_the_session_time(self):
+        nested = {"type": "user", "toolUseResult": {"timestamp": stamp(1)}, "message": {"content": "x"}}
+        path = self.transcript("n", [at(assistant("a", 1000), 15), nested, '{"timestamp": "not a date"}', "not json"])
+        self.assertAlmostEqual(common.last_activity(path), time.time() - 15 * 86400, delta=5)
+
+    def test_deep_or_absurd_lines_do_not_crash(self):
+        deep = '{"timestamp": "' + stamp(1) + '", "x": ' + "[" * 100_000 + "]" * 100_000 + "}"
+        big = {"type": "assistant", "timestamp": stamp(2), "message": {"id": "big", "usage": {
+            "input_tokens": 10 ** 400, "cache_read_input_tokens": 1e300, "output_tokens": 10 ** 400}}}
+        path = self.transcript("deep", [at(assistant("a", 1000), 3), big, deep])
+        self.assertAlmostEqual(common.last_activity(path), time.time() - 2 * 86400, delta=5)
+        self.assertEqual(common.num(10 ** 400), 0)
+        self.assertEqual(common.num(1e300), 0)
+        self.assertEqual(common.num(common.MAX_TOKENS), common.MAX_TOKENS)
+        r = common.session_stats(path)
+        self.assertEqual((r["calls"], r["peak"]), (1, 1000))
+        self.assertIsNotNone(common.last_context(path))
+        for script in ("measure.py", "audit_start.py"):
+            proc = self.run_script(script, "--project=-tmp-demo")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_transcript_without_times_falls_back_to_file_date(self):
+        path = self.transcript("plain", [assistant("a", 1000)])
+        self.touch(path, 12)
+        self.assertAlmostEqual(common.last_activity(path), time.time() - 12 * 86400, delta=5)
+        now = time.time()
+        self.assertEqual(common.transcripts(self.pdir, now - 7 * 86400, now), [])
+
+    def test_memory_mentions_ignore_old_sessions_with_a_new_file_date(self):
+        self.transcript("old", [at({"type": "user", "message": {"content": "read /memory/a.md"}}, 60)])
+        self.transcript("new", [at({"type": "user", "message": {"content": "read /memory/b.md"}}, 3)])
+        self.assertEqual(memory_check.mentioned_names(self.pdir, ["a.md", "b.md"], 30), {"b.md"})
+
+
+class SavedRunTests(Base):
+    """The week before comes from the run saved then; a run of the same window is saved once."""
+
+    def history(self):
+        with open(os.path.join(common.data_dir(), measure.HISTORY)) as f:
+            return [json.loads(line) for line in f]
+
+    def window(self, weeks_back):
+        until = dt.date.today() - dt.timedelta(days=7 * weeks_back)
+        return str(until - dt.timedelta(days=6)), str(until)
+
+    def saved(self, weeks_back, **metrics):
+        since, until = self.window(weeks_back)
+        return {"v": measure.HISTORY_VERSION, "date": until, "since": since, "until": until,
+                "project": "-tmp-demo", "metrics": dict({"sessions": 9}, **metrics)}
+
+    def write_history(self, *entries):
+        os.makedirs(common.data_dir(), exist_ok=True)
+        self.write(os.path.join(common.data_dir(), measure.HISTORY),
+                   "".join((e if isinstance(e, str) else json.dumps(e)) + "\n" for e in entries))
+
+    def test_compare_uses_the_saved_run_of_the_week_before(self):
+        self.transcript("now", [at(assistant("a", 100_000), 1)])
+        self.transcript("before", [at(assistant("b", 50_000), 9)])  # would give 50k if recomputed
+        self.write_history(self.saved(1, first_median=70_000, calls=70, cache_read_total=7_000_000))
+        proc = self.run_script("measure.py", "--project=-tmp-demo", "--compare", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["previous"]["first_median"], 70_000)
+        self.assertEqual(r["previous"]["calls_per_day"], 10)
+        self.assertEqual(r["previous"]["cache_read_per_day"], 1_000_000)
+        self.assertIn("run saved on", r["previous_source"])
+        text = self.run_script("measure.py", "--project=-tmp-demo", "--compare").stdout
+        self.assertIn("(70k -> 100k, +43%)", text)
+        self.assertIn("run saved on " + self.window(1)[1], text)
+
+    def test_compare_recomputes_when_no_run_was_saved(self):
+        self.transcript("now", [at(assistant("a", 100_000), 1)])
+        self.transcript("before", [at(assistant("b", 50_000), 9)])
+        self.write_history(self.saved(3, first_median=70_000), dict(self.saved(1, first_median=70_000), project="other"))
+        proc = self.run_script("measure.py", "--project=-tmp-demo", "--compare", "--json")
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["previous"]["first_median"], 50_000)
+        self.assertIn("recomputed today", r["previous_source"])
+        self.assertEqual(r["baseline"]["first_median"], 70_000)
+
+    def test_saving_only_appends_and_the_newest_run_of_a_window_wins(self):
+        first = self.saved(1, first_median=60_000)
+        self.write_history(self.saved(2), "not json", first, dict(self.saved(1, first_median=70_000), date="later"))
+        path = os.path.join(common.data_dir(), measure.HISTORY)
+        before = self.read(path)
+        self.transcript("s", [at(assistant("a", 100_000), 1)])
+        for _ in range(2):
+            proc = self.run_script("measure.py", "--project=-tmp-demo", "--compare", "--save", "--json")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        after = self.read(path)
+        self.assertTrue(after.startswith(before))
+        self.assertEqual(len(after.splitlines()), len(before.splitlines()) + 2)
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["previous"]["first_median"], 70_000)
+        self.assertIn("later", r["previous_source"])
+        self.assertEqual(r["baseline"]["sessions"], 9)
+
+    def test_unreadable_history_is_never_replaced(self):
+        self.write_history(self.saved(2), self.saved(1))
+        path = os.path.join(common.data_dir(), measure.HISTORY)
+        before = self.read(path)
+        self.transcript("s", [at(assistant("a", 100_000), 1)])
+        os.chmod(path, 0o000)
+        try:
+            proc = self.run_script("measure.py", "--project=-tmp-demo", "--save")
+        finally:
+            os.chmod(path, 0o600)
+        if os.geteuid() != 0:  # root can still write
+            self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(self.read(path).startswith(before))
+
+    def test_odd_history_lines_do_not_crash(self):
+        deep = "[" * 100_000 + "]" * 100_000
+        huge = dict(self.saved(1, calls=10 ** 400, cache_read_total=10 ** 400))
+        self.write_history(deep, self.saved(2, first_median=70_000), huge)
+        with open(os.path.join(common.data_dir(), measure.HISTORY), "ab") as f:
+            f.write(b"\xff\xfe not utf-8\n")
+        self.transcript("s", [at(assistant("a", 100_000), 1)])
+        for args in (["--compare"], ["--compare", "--json"], ["--compare", "--save"]):
+            proc = self.run_script("measure.py", "--project=-tmp-demo", *args)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+
+    def test_per_day_values_and_compacted_sessions(self):
+        self.transcript("c", [at(assistant("a", 100_000), 1), at(assistant("b", 320_000), 1),
+                              {"type": "system", "subtype": "compact_boundary"}, at(assistant("c", 90_000), 1)])
+        self.transcript("d", [at(assistant("d", 70_000), 2)])
+        proc = self.run_script("measure.py", "--project=-tmp-demo", "--days", "4", "--json")
+        m = json.loads(proc.stdout)["now"]
+        self.assertEqual((m["sessions"], m["sessions_compacted"], m["days"], m["calls_per_day"]), (2, 1, 4, 1))
+        self.assertEqual(m["cache_read_per_day"], m["cache_read_total"] / 4)
+        text = self.run_script("measure.py", "--project=-tmp-demo", "--days", "4").stdout
+        for name in ("sessions that compacted at least once", "model calls per day", "cache reads per day"):
+            self.assertIn(name, text)
+
+    def test_baseline_gets_per_day_values_from_its_own_window(self):
+        old = self.saved(4, calls=1400, cache_read_total=14_000_000)
+        old["since"] = str(dt.date.fromisoformat(old["until"]) - dt.timedelta(days=13))  # a 14-day baseline
+        self.write_history(old)
+        self.transcript("now", [at(assistant("a", 100_000), 1)])
+        r = json.loads(self.run_script("measure.py", "--project=-tmp-demo", "--compare", "--json").stdout)
+        self.assertEqual(r["baseline"]["calls_per_day"], 100)
+        text = self.run_script("measure.py", "--project=-tmp-demo", "--compare").stdout
+        line = [ln for ln in text.splitlines() if "model calls per day" in ln][0]
+        self.assertIn("vs baseline", line)
+
+
 if __name__ == "__main__":
     unittest.main()

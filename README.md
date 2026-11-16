@@ -50,8 +50,11 @@ the model, not guaranteed.
 Claude Code keeps one transcript per session in `~/.claude/projects/<key>/`, where `<key>` is the
 project's absolute path with every character that is not a letter or a digit replaced by `-` (so
 `/Users/me/my app` becomes `-Users-me-my-app`). Memory is in `~/.claude/projects/<key>/memory/`.
-The `--days` window picks transcripts by file modification time, so a long session counts in the
-window where it was last active. If `$CLAUDE_CONFIG_DIR` is set, the scripts look there instead of
+The `--days` window picks transcripts by the last timestamp recorded inside each one, so a long
+session counts in the window where it was last active. The file's modification time is not used:
+backup tools, sync tools and the app can change it long after a session ended (it is only the
+fallback for a transcript that records no time). The week-over-week comparison uses the run saved
+the week before, when there is one. If `$CLAUDE_CONFIG_DIR` is set, the scripts look there instead of
 `~/.claude`.
 
 ## The intake questions

@@ -145,20 +145,72 @@ def regular_files(folder, suffix):
     return out
 
 
+def _record_time(raw):
+    """Top-level timestamp of one transcript line (bytes), or None."""
+    if b'"timestamp"' not in raw:
+        return None
+    try:
+        x = json.loads(raw)
+    except (ValueError, RecursionError):  # RecursionError: a line nested too deep
+        return None
+    return parse_iso(x.get("timestamp")) if isinstance(x, dict) else None
+
+
+def last_activity(path, st=None, tails=(65_536, 1_048_576)):
+    """When a session was last active: the newest timestamp recorded in its transcript.
+
+    The file's modification time is not used when the transcript records a time:
+    backup tools, sync tools and the app can change it long after the session
+    ended. It is only the fallback for a transcript with no timestamps. The end
+    of the file is read first; the whole file, one line at a time, only when the
+    end has no timestamp.
+    """
+    st = st or os.stat(path)
+    try:
+        with open(path, "rb") as f:
+            for tail in tails:
+                start = max(0, st.st_size - tail)
+                f.seek(start)
+                lines = f.read().splitlines()
+                for raw in reversed(lines[1:] if start else lines):  # the first line may be cut
+                    t = _record_time(raw)
+                    if t is not None:
+                        return t
+                if not start:
+                    return st.st_mtime
+            f.seek(0)
+            last = None
+            for raw in f:  # one line in memory at a time
+                t = _record_time(raw)
+                if t is not None:
+                    last = t
+            if last is not None:
+                return last
+    except OSError:
+        pass
+    return st.st_mtime
+
+
 def transcripts(pdir, lo=None, hi=None):
-    """Main-session transcripts whose last activity falls in [lo, hi)."""
-    out = [(st.st_mtime, f) for f, st in regular_files(pdir, ".jsonl")
-           if (lo is None or st.st_mtime >= lo) and (hi is None or st.st_mtime < hi)]
+    """Main-session transcripts whose last activity (see last_activity) falls in [lo, hi)."""
+    out = []
+    for f, st in regular_files(pdir, ".jsonl"):
+        t = st.st_mtime if lo is None and hi is None else last_activity(f, st)
+        if (lo is None or t >= lo) and (hi is None or t < hi):
+            out.append((t, f))
     return [f for _, f in sorted(out)]
 
 
+MAX_TOKENS = 10 ** 12  # no real call is near this; larger values would overflow the averages
+
+
 def num(v):
-    """A token count: int for finite non-negative int/float, 0 for anything else."""
+    """A token count: int for a finite int/float from 0 to MAX_TOKENS, 0 for anything else."""
     if isinstance(v, bool):
         return 0
     if isinstance(v, int):
-        return v if v >= 0 else 0
-    if isinstance(v, float) and math.isfinite(v) and v >= 0:
+        return v if 0 <= v <= MAX_TOKENS else 0
+    if isinstance(v, float) and math.isfinite(v) and 0 <= v <= MAX_TOKENS:
         return int(v)
     return 0
 
@@ -186,7 +238,7 @@ def session_stats(path, image_tokens=DEFAULTS["image_tokens"]):
         for line in f:
             try:
                 x = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if not isinstance(x, dict):
                 continue
@@ -284,7 +336,7 @@ def last_context(path, tail_bytes=4_000_000):
             continue
         try:
             x = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(x, dict):
             continue
@@ -306,9 +358,11 @@ def parse_iso(s):
     """Timestamp of an ISO date or date-time string, or None."""
     if not isinstance(s, str):
         return None
+    if s.endswith(("Z", "z")):  # Python before 3.11 does not read the "Z" suffix
+        s = s[:-1] + "+00:00"
     try:
         return dt.datetime.fromisoformat(s).timestamp()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         return None
 
 

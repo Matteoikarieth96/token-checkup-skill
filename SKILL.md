@@ -112,18 +112,30 @@ project folder in its prompt, so it skips this step.
 1. **Measure:**
    `python3 "<skill dir>/scripts/measure.py" --project "<project folder>" --days 7 --compare --save`.
    Read:
+   - the last line of the output: it says where "the week before" comes from. "run saved on
+     <date>" is the measurement made that week, the one to trust. "recomputed today" means no run
+     was saved for that window: say so, because sessions that went on later now count in a later
+     window.
    - first-call context against the week before and by Claude Code version. A jump that lines up
-     with a new version is the app, not the user's setup; say so and move on.
+     with a new version is the app, not the user's setup; say so and move on. The same holds for
+     "vs baseline": a baseline that mixes older app versions makes the start look as if it grew.
    - "sessions that should have compacted but did not (since setup)": sessions started after setup
      that passed the compact window x1.1 and never compacted. More than zero means compaction is not
      working (check `autoCompactWindow`, env overrides and the model's window): flag it first.
      "sessions over the compact window x1.1 (any)" also counts older sessions.
    - compactions: where they fired and where sessions restarted.
-   - mean context per model call (the full context of each call) and cache reads per session: the
-     main levers.
+   - mean context per model call (the full context of each call), cache reads per day and model
+     calls per day: the main levers, and the numbers for the headline. Cache reads per day falling
+     while calls per day hold means the same work costs less.
+   - peak context (median) and cache reads per session (median) jump between weeks when sessions
+     come in two groups (short ones, and long ones that reach compaction): do not build the
+     headline on them. "sessions that compacted at least once" out of all sessions says how many
+     were long.
    - tools that filled sessions and the image count (screenshots and frames are the costly ones).
-   - "vs baseline" appears only for medians and per-call values, because the two windows can differ
-     in length.
+   - "vs baseline" appears only for medians, per-call and per-day values, because the two windows
+     can differ in length.
+   - a second run of the same window adds a line to the history; comparisons use the newest saved
+     run of a window, and the baseline stays the first run ever saved.
 2. **Start audit:**
    `python3 "<skill dir>/scripts/audit_start.py" --project "<project folder>" --days 7`. Growth in
    `deferred_tools_delta` means new connector or MCP tools, `instructions` means server instructions
@@ -171,6 +183,8 @@ project folder in its prompt, so it skips this step.
 ## Reading the numbers
 
 - the numbers come from this machine's transcripts of one project only.
+- a session belongs to the window of the last timestamp recorded in its transcript, not of the
+  file's modification time, which other tools can change later.
 - tokens are estimated as characters / 4; an image in a tool result as about 1,600 tokens; bytes
   recorded in transcripts are JSON and overstate the text.
 - the system prompt and tool definitions are not in transcripts. The first-call context and its split

@@ -14,11 +14,15 @@ user's language. Mark every number as measured or estimated. Never quote a secre
 | Sessions | | | - |
 | First-call context (median) | | | |
 | Mean context per model call | | | |
+| Model calls per day | | | |
+| Cache reads per day | | | |
+| Sessions that compacted at least once (of all sessions) | | | - |
 | Sessions that should have compacted but did not (since setup) | | | - |
 | Compactions (fired at about) | | | - |
 | Cache reads per session (median) | | | |
 
-"vs baseline" only for medians and per-call values: the windows can differ in length.
+"vs baseline" only for medians, per-call and per-day values: the windows can differ in length.
+Say under the table where "last week" comes from: the run saved that week, or recomputed today.
 
 ## What grew at session start
 <Only real growth, with its likely cause: app version, connectors, skills, hooks, CLAUDE.md, memory.>
