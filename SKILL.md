@@ -1,6 +1,6 @@
 ---
 name: token-checkup
-description: Weekly token checkup for Claude Code. Measures how big sessions get and what every session loads before the first answer, catches silent growth (app updates, new connectors, longer hooks, bigger memory), keeps memory accurate and lean (fact checks only on what changed, archive and split proposals), and can install a context-guard hook plus earlier auto-compaction. Use it when the user wants to optimize or cut token use, check context or session size, run or schedule the weekly token checkup, review or clean Claude's memory, asks why sessions are so big or slow, or says "ottimizza i token", "controllo settimanale dei token", "pulisci la memoria", "quanto contesto uso", "token checkup", even without saying "skill". Not for API billing questions or for optimizing an app's own LLM calls.
+description: Weekly token checkup for Claude Code. Measures session size and what every session loads at start, catches silent growth and keeps memory accurate and lean. Use when the user wants to cut token use, check context size or clean Claude's memory, or says "ottimizza i token", "controllo settimanale dei token", "pulisci la memoria", "quanto contesto uso". Not for API billing or an app's own LLM calls.
 ---
 
 # token-checkup
